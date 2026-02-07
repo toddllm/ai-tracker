@@ -9,7 +9,7 @@ It runs as a live terminal dashboard and:
 - starts immediately with an active TUI, then refreshes in the background
 - refreshes feed data hourly (default)
 - keeps a real-time Ollama model list (size-sorted)
-- analyzes top feed items using local Ollama model `gpt-oss:120b` by default
+- analyzes top feed items using local Ollama model `nemotron-3-nano` by default
 - generates a long-form Ollama markdown briefing with scroll support in the TUI
 - renders briefing in two columns (main brief + snapshot sidebar fallback)
 - shows a local Ollama chat sidebar in the brief second column (toggleable)
@@ -42,7 +42,7 @@ cp .env.example .env
 
 ## Run
 
-Default (hourly refresh, trending sort, Ollama analysis with `gpt-oss:120b`):
+Default (hourly refresh, trending sort, Ollama analysis with `nemotron-3-nano`):
 
 ```bash
 python app.py
@@ -63,7 +63,7 @@ python app.py --sources newsletters --strict-topics --topics "agents, multimodal
 ## Key Flags
 
 - `--refresh-minutes 60` update interval (default `60`)
-- `--ollama-model gpt-oss:120b` analysis model (default `gpt-oss:120b`)
+- `--ollama-model nemotron-3-nano` analysis model (default `nemotron-3-nano`)
 - `--analysis-limit 15` number of items sent to Ollama each cycle
 - `--model-poll-seconds 30` refresh interval for live Ollama model list
 - `--sources newsletters,arxiv,x`
@@ -110,7 +110,7 @@ Commands:
 - `/sort <newest|trending>` change sorting quickly
 - `/lookback <days>` set lookback window quickly
 - `/max <items>` set item cap quickly
-- `/model <name>` set Ollama model quickly
+- `/model [list|index|name]` pick an Ollama model from local tags or set by name
 - `/strict <on|off>` toggle strict topic mode quickly
 - `/limit <n>` set analysis limit quickly
 - `/set <key> <value>` update settings live
@@ -155,7 +155,7 @@ ollama serve
 - Ensure analysis model exists locally:
 
 ```bash
-ollama pull gpt-oss:120b
+ollama pull nemotron-3-nano
 ```
 
 The dashboard shows model availability warnings if the selected model is missing.

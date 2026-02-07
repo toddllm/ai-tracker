@@ -44,7 +44,7 @@ X_SEARCH_ENDPOINTS = [
     "https://api.twitter.com/2/tweets/search/recent",
 ]
 DEFAULT_OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
-DEFAULT_OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gpt-oss:120b")
+DEFAULT_OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "nemotron-3-nano")
 DEFAULT_TOPICS = "agents, open-source models, multimodal, reasoning"
 
 NEWSLETTER_FEEDS: dict[str, str] = {
@@ -650,7 +650,10 @@ def choose_chat_model(models: list[dict[str, Any]], fallback_model: str) -> str:
             score += 20.0
         else:
             score += 5.0
-        if any(token in lowered for token in ("qwen", "llama", "mistral", "gemma", "phi", "gpt-oss")):
+        if any(
+            token in lowered
+            for token in ("qwen", "llama", "mistral", "gemma", "phi", "gpt-oss", "nemotron")
+        ):
             score += 15.0
         score -= abs(size_gb - 12.0)
         candidates.append({"name": name, "score": score, "size_gb": size_gb})
@@ -1888,7 +1891,7 @@ def handle_slash_command(
                 runtime_state,
                 "Commands: /help | /config | /set <key> <value> | /sources <csv> | "
                 "/newsletters <all|csv> | /topics <csv> | /sort <newest|trending> | "
-                "/lookback <days> | /max <items> | /model <name> | /strict <on|off> | "
+                "/lookback <days> | /max <items> | /model [list|index|name] | /strict <on|off> | "
                 "/limit <n> | /refresh | /export [md|json|csv] [path] | "
                 "/open [index] | /brief [focus|normal|toggle|top] | /focus <section> | "
                 "/size <status|brief|body> <1..12> | /layout [right 2-6] | "
@@ -1983,13 +1986,103 @@ def handle_slash_command(
             )
         return False
 
-    if command in {"topics", "sort", "lookback", "max", "model", "strict", "limit"}:
+    if command == "model":
+        with state_lock:
+            models = list(runtime_state.cycle_state.get("models", []))
+
+        if not args or args[0].lower() in {"list", "ls"}:
+            with state_lock:
+                current = config.ollama_model or "(unset)"
+                if not models:
+                    append_command_log(
+                        runtime_state,
+                        f"Current model: {current}. No local Ollama tags discovered yet.",
+                    )
+                    append_command_log(runtime_state, "Use /model <index|name> to set.")
+                else:
+                    preview = [
+                        f"{idx}:{model.get('name', '?')} ({humanize_bytes(model.get('size_bytes'))})"
+                        for idx, model in enumerate(models[:8], start=1)
+                    ]
+                    append_command_log(runtime_state, f"Current model: {current}")
+                    append_command_log(runtime_state, "Models: " + " | ".join(preview))
+                    if len(models) > 8:
+                        append_command_log(
+                            runtime_state,
+                            f"... plus {len(models) - 8} more. Use /model <index|name>.",
+                        )
+            return False
+
+        requested = " ".join(args).strip()
+        selected_model = ""
+        available_names = [normalize_text(model.get("name", "")) for model in models]
+        available_names = [name for name in available_names if name]
+        lower_to_name = {name.lower(): name for name in available_names}
+
+        if requested.lower() == "auto":
+            selected_model = choose_chat_model(models, config.ollama_model)
+        elif requested.isdigit():
+            index = int(requested)
+            if index < 1 or index > len(models):
+                with state_lock:
+                    append_command_log(
+                        runtime_state,
+                        f"Invalid model index {index}. Use /model list.",
+                    )
+                return False
+            selected_model = normalize_text(models[index - 1].get("name", ""))
+        else:
+            exact = lower_to_name.get(requested.lower(), "")
+            if exact:
+                selected_model = exact
+            else:
+                prefix_matches = [
+                    name for name in available_names if name.lower().startswith(requested.lower())
+                ]
+                if len(prefix_matches) == 1:
+                    selected_model = prefix_matches[0]
+                elif len(prefix_matches) > 1:
+                    with state_lock:
+                        append_command_log(
+                            runtime_state,
+                            "Ambiguous model name. Matches: " + ", ".join(prefix_matches[:6]),
+                        )
+                    return False
+                else:
+                    selected_model = requested
+
+        if not selected_model:
+            with state_lock:
+                append_command_log(runtime_state, "No model selected. Use /model list.")
+            return False
+
+        with state_lock:
+            config.ollama_model = selected_model
+            runtime_state.chat_model = selected_model
+            runtime_state.chat_model_auto = False
+            if selected_model.lower() in lower_to_name:
+                runtime_state.chat_status = f"Chat model: {selected_model}"
+                append_command_log(runtime_state, f"ollama_model -> {selected_model}")
+            else:
+                runtime_state.chat_status = (
+                    f"Chat model set to '{selected_model}' (not in local tags)."
+                )
+                append_command_log(
+                    runtime_state,
+                    (
+                        f"ollama_model -> {selected_model} (not discovered locally). "
+                        f"Run: ollama pull {selected_model}"
+                    ),
+                )
+            append_command_log(runtime_state, "Chat model pinned to match /model selection.")
+        return False
+
+    if command in {"topics", "sort", "lookback", "max", "strict", "limit"}:
         key_map = {
             "topics": "topics",
             "sort": "sort",
             "lookback": "lookback_days",
             "max": "max_items",
-            "model": "ollama_model",
             "strict": "strict_topics",
             "limit": "analysis_limit",
         }
@@ -2487,7 +2580,7 @@ def render_menu_panel(show_menu: bool) -> Panel:
         "- /sort <newest|trending>\n"
         "- /lookback <days>\n"
         "- /max <items>\n"
-        "- /model <name>\n"
+        "- /model [list|index|name]\n"
         "- /strict <on|off>\n"
         "- /limit <n>\n"
         "- /set <key> <value>\n"
@@ -2535,7 +2628,7 @@ def render_command_bar(
         return Text(truncate(text, max_chars), style="bold magenta")
     hint = (
         "Slash: /help /config /topics <csv> /sources <csv> /newsletters <all|csv> "
-        "/sort <newest|trending> /ask <question> /chat on|off /refresh /export /quit"
+        "/sort <newest|trending> /model [list|index|name] /ask <question> /chat on|off /refresh /export /quit"
     )
     return Text(truncate(hint, max_chars), style="magenta")
 
