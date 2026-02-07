@@ -30,7 +30,8 @@ import feedparser
 import requests
 from dateutil import parser as date_parser
 from dotenv import load_dotenv
-from rich.console import Console, Group
+from rich.console import Console
+from rich.layout import Layout
 from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -57,6 +58,17 @@ NEWSLETTER_FEEDS: dict[str, str] = {
 }
 
 VALID_SOURCES = {"x": "X", "arxiv": "arXiv", "newsletters": "Newsletters"}
+SECTION_ORDER = (
+    "status",
+    "brief",
+    "feed",
+    "story",
+    "models",
+    "sources",
+    "menu",
+    "commands",
+)
+RIGHT_SECTIONS = {"story", "models", "sources", "menu", "commands"}
 
 HTML_TAG_RE = re.compile(r"<[^>]+>")
 WHITESPACE_RE = re.compile(r"\s+")
@@ -94,6 +106,10 @@ class RuntimeState:
     right_column_ratio: int
     brief_focus: bool
     brief_scroll: int
+    active_section: str
+    status_row_ratio: int
+    brief_row_ratio: int
+    body_row_ratio: int
     show_menu: bool
     in_command_mode: bool
     command_buffer: str
@@ -1085,6 +1101,37 @@ def clamp_right_column_ratio(value: int) -> int:
     return max(2, min(6, value))
 
 
+def clamp_row_ratio(value: int) -> int:
+    return max(1, min(12, value))
+
+
+def cycle_section(current: str, step: int) -> str:
+    if current not in SECTION_ORDER:
+        return SECTION_ORDER[0]
+    index = SECTION_ORDER.index(current)
+    return SECTION_ORDER[(index + step) % len(SECTION_ORDER)]
+
+
+def section_to_row(section: str) -> str:
+    if section == "status":
+        return "status"
+    if section == "brief":
+        return "brief"
+    return "body"
+
+
+def adjust_focused_row_height(runtime_state: RuntimeState, delta: int) -> str:
+    row_key = section_to_row(runtime_state.active_section)
+    if row_key == "status":
+        runtime_state.status_row_ratio = clamp_row_ratio(runtime_state.status_row_ratio + delta)
+        return f"status_row_ratio -> {runtime_state.status_row_ratio}"
+    if row_key == "brief":
+        runtime_state.brief_row_ratio = clamp_row_ratio(runtime_state.brief_row_ratio + delta)
+        return f"brief_row_ratio -> {runtime_state.brief_row_ratio}"
+    runtime_state.body_row_ratio = clamp_row_ratio(runtime_state.body_row_ratio + delta)
+    return f"body_row_ratio -> {runtime_state.body_row_ratio}"
+
+
 def open_link(url: str) -> str:
     clean_url = url.strip()
     if not clean_url:
@@ -1172,11 +1219,13 @@ def build_brief_panel(
     brief_scroll: int,
     terminal_width: int,
     terminal_height: int,
+    focused: bool = False,
 ) -> tuple[Panel, int, int]:
+    border_style = "bright_green" if focused else "green"
     markdown_text = format_llm_brief_markdown(llm_brief)
     if markdown_text == "_No brief available yet._":
         return (
-            Panel(Markdown(markdown_text), title="Ollama Brief", border_style="green"),
+            Panel(Markdown(markdown_text), title="Ollama Brief", border_style=border_style),
             0,
             0,
         )
@@ -1208,7 +1257,7 @@ def build_brief_panel(
     if body:
         body += "\n\n"
     body += footer
-    return Panel(body, title="Ollama Brief", border_style="green"), max_scroll, offset
+    return Panel(body, title="Ollama Brief", border_style=border_style), max_scroll, offset
 
 
 def format_story_markdown(item: dict[str, Any]) -> str:
@@ -1485,7 +1534,8 @@ def handle_slash_command(
                 runtime_state,
                 "Commands: /help | /config | /set <key> <value> | /sources <csv> | "
                 "/newsletters <all|csv> | /refresh | /export [md|json|csv] [path] | "
-                "/open [index] | /brief [focus|normal|toggle|top] | /layout [right 2-6] | "
+                "/open [index] | /brief [focus|normal|toggle|top] | /focus <section> | "
+                "/size <status|brief|body> <1..12> | /layout [right 2-6] | "
                 "/menu [on|off|toggle] | /clearlog | /quit",
             )
         return False
@@ -1500,13 +1550,21 @@ def handle_slash_command(
         with state_lock:
             if mode == "on":
                 runtime_state.show_menu = True
+                runtime_state.active_section = "menu"
             elif mode == "off":
                 runtime_state.show_menu = False
+                if runtime_state.active_section == "menu":
+                    runtime_state.active_section = "story"
             else:
                 runtime_state.show_menu = not runtime_state.show_menu
+                if runtime_state.show_menu:
+                    runtime_state.active_section = "menu"
             append_command_log(
                 runtime_state,
-                f"menu -> {'visible' if runtime_state.show_menu else 'hidden'}",
+                (
+                    f"menu -> {'visible' if runtime_state.show_menu else 'hidden'} | "
+                    f"focus -> {runtime_state.active_section}"
+                ),
             )
         return False
 
@@ -1528,6 +1586,55 @@ def handle_slash_command(
                 runtime_state,
                 f"brief_focus -> {runtime_state.brief_focus} | brief_scroll -> {runtime_state.brief_scroll}",
             )
+        return False
+
+    if command == "focus":
+        if not args:
+            with state_lock:
+                append_command_log(
+                    runtime_state,
+                    f"Usage: /focus <section>; valid: {','.join(SECTION_ORDER)}",
+                )
+            return False
+        requested = args[0].strip().lower()
+        if requested not in SECTION_ORDER:
+            with state_lock:
+                append_command_log(
+                    runtime_state,
+                    f"Invalid section '{requested}'. Valid: {','.join(SECTION_ORDER)}",
+                )
+            return False
+        with state_lock:
+            runtime_state.active_section = requested
+            if requested == "menu":
+                runtime_state.show_menu = True
+            append_command_log(runtime_state, f"focus -> {runtime_state.active_section}")
+        return False
+
+    if command == "size":
+        if len(args) < 2:
+            with state_lock:
+                append_command_log(runtime_state, "Usage: /size <status|brief|body> <1..12>")
+            return False
+        row_name = args[0].strip().lower()
+        try:
+            parsed = clamp_row_ratio(int(args[1]))
+        except ValueError:
+            with state_lock:
+                append_command_log(runtime_state, "Usage: /size <status|brief|body> <1..12>")
+            return False
+        with state_lock:
+            if row_name == "status":
+                runtime_state.status_row_ratio = parsed
+                append_command_log(runtime_state, f"status_row_ratio -> {parsed}")
+            elif row_name == "brief":
+                runtime_state.brief_row_ratio = parsed
+                append_command_log(runtime_state, f"brief_row_ratio -> {parsed}")
+            elif row_name == "body":
+                runtime_state.body_row_ratio = parsed
+                append_command_log(runtime_state, f"body_row_ratio -> {parsed}")
+            else:
+                append_command_log(runtime_state, "Usage: /size <status|brief|body> <1..12>")
         return False
 
     if command == "layout":
@@ -1834,10 +1941,11 @@ def render_menu_panel(show_menu: bool) -> Panel:
         "Hotkeys:\n"
         "- / : enter command mode\n"
         "- Enter : submit command (or open story in normal mode)\n"
-        "- Tab / Shift+Tab : next/prev story\n"
+        "- Tab / Shift+Tab : cycle focused section\n"
         "- j / k : next/prev story\n"
-        "- Up / Down : next/prev story (or brief scroll in focus mode)\n"
+        "- Up / Down : story nav (or brief scroll when brief focused)\n"
         "- PgUp / PgDn : scroll brief\n"
+        "- + / - : grow/shrink focused row\n"
         "- o : open selected story link\n"
         "- b : toggle brief focus mode\n"
         "- [ / ] : resize right column narrower/wider\n"
@@ -1853,11 +1961,68 @@ def render_menu_panel(show_menu: bool) -> Panel:
         "- /refresh\n"
         "- /open [index]\n"
         "- /brief [focus|normal|toggle|top]\n"
+        "- /focus <section>\n"
+        "- /size <status|brief|body> <1..12>\n"
         "- /layout right <2..6>\n"
         "- /export [md|json|csv] [path]\n"
+        "- /menu [on|off|toggle]\n"
+        "- /clearlog\n"
         "- /quit"
     )
     return Panel(body, title="Menu", border_style="blue")
+
+
+def render_warning_bar(warnings: list[str], terminal_width: int) -> Panel:
+    if not warnings:
+        return Panel(
+            "Warnings: none",
+            title="Warnings",
+            border_style="yellow",
+            padding=(0, 1),
+        )
+    clean = [normalize_text(warn) for warn in warnings if normalize_text(warn)]
+    if not clean:
+        clean = ["Unknown warning"]
+    shown = clean[:2]
+    text = " | ".join(shown)
+    if len(clean) > 2:
+        text += f" | (+{len(clean) - 2} more)"
+    max_chars = max(40, terminal_width - 24)
+    text = truncate(text, max_chars)
+    return Panel(
+        text,
+        title="Warnings",
+        border_style="yellow",
+        padding=(0, 1),
+    )
+
+
+def render_right_section(
+    active_section: str,
+    items: list[dict[str, Any]],
+    selected_index: int,
+    models: list[dict[str, Any]],
+    config: AppConfig,
+    show_menu: bool,
+    command_log: list[str],
+    in_command_mode: bool,
+    command_buffer: str,
+) -> tuple[str, Any]:
+    if active_section == "models":
+        return "Models", render_models_table(models, config.ollama_model, config.model_list_size)
+    if active_section == "sources":
+        return "Source Mix", render_source_counts(items)
+    if active_section == "menu":
+        menu_panel = render_menu_panel(True)
+        return str(menu_panel.title or "Menu"), menu_panel.renderable
+    if active_section == "commands":
+        command_panel = render_command_panel(command_log, in_command_mode, command_buffer)
+        return str(command_panel.title or "Commands"), command_panel.renderable
+    if show_menu:
+        menu_panel = render_menu_panel(True)
+        return str(menu_panel.title or "Menu"), menu_panel.renderable
+    story_panel = render_selected_story_panel(items, selected_index)
+    return str(story_panel.title or "Selected Story"), story_panel.renderable
 
 
 def build_dashboard(
@@ -1874,6 +2039,10 @@ def build_dashboard(
     right_column_ratio: int,
     brief_focus: bool,
     brief_scroll: int,
+    active_section: str,
+    status_row_ratio: int,
+    brief_row_ratio: int,
+    body_row_ratio: int,
     terminal_width: int,
     terminal_height: int,
 ) -> Panel:
@@ -1891,64 +2060,49 @@ def build_dashboard(
         brief_scroll=brief_scroll,
         terminal_width=terminal_width,
         terminal_height=terminal_height,
+        focused=(active_section == "brief"),
     )
 
+    topics_short = truncate(config.topics or "(none)", 64)
     status_lines = [
-        f"Last refresh: {started.strftime('%Y-%m-%d %H:%M:%S UTC')}",
-        f"Next refresh in: {seconds_to_next_run}s",
-        f"Cycle runtime: {elapsed_seconds:.1f}s",
-        f"State: {'refreshing' if is_refreshing else 'idle'}",
-        f"Message: {status_message}",
         (
-            "Input: / command mode | Tab/j/k navigate | Enter/o open | "
-            "b brief focus | PgUp/PgDn brief scroll | [ ] resize | q quit"
+            f"Refresh: {started.strftime('%Y-%m-%d %H:%M:%S UTC')} | Next: {seconds_to_next_run}s | "
+            f"Cycle: {elapsed_seconds:.1f}s | State: {'refreshing' if is_refreshing else 'idle'} | "
+            f"Focus: {active_section} | Mode: {'strict' if config.strict_topics else 'broad'} | "
+            f"Sort: {config.sort_mode}"
         ),
-        f"Topics: {config.topics or '(none)'}",
-        f"Mode: {'strict' if config.strict_topics else 'broad'} | Sort: {config.sort_mode}",
         (
-            f"Layout: right_col={right_column_ratio} | brief_focus={brief_focus} | "
-            f"brief_scroll={clamped_brief_scroll}/{max_brief_scroll}"
+            f"Topics: {topics_short} | Rows={status_row_ratio}:{brief_row_ratio}:{body_row_ratio} | "
+            f"Right={right_column_ratio} | Brief={clamped_brief_scroll}/{max_brief_scroll} | "
+            f"Model={config.ollama_model} | Limit={config.analysis_limit} | "
+            "Hotkeys: Tab section, j/k stories, PgUp/PgDn brief, +/- row size, [ ] width, q quit"
         ),
-        f"Analysis model: {config.ollama_model} | Analysis limit: {config.analysis_limit}",
     ]
-    status_panel = Panel("\n".join(status_lines), title="Status", border_style="cyan")
+    status_panel = Panel(
+        "\n".join(status_lines),
+        title="Status",
+        border_style="bright_cyan" if active_section == "status" else "cyan",
+    )
 
     warnings: list[str] = []
     if model_error:
         warnings.append(model_error)
     warnings.extend(errors)
+    warning_bar = render_warning_bar(warnings, terminal_width)
 
-    if warnings:
-        warning_text = "\n".join(f"- {warn}" for warn in warnings[:8])
-        warning_panel = Panel(warning_text, title="Warnings", border_style="yellow")
-    else:
-        warning_panel = Panel("No warnings.", title="Warnings", border_style="yellow")
-
-    top_row = Table.grid(expand=True)
-    top_row.add_column(ratio=1)
-    top_row.add_column(ratio=1)
-    top_row.add_row(status_panel, warning_panel)
-
-    middle_row = Table.grid(expand=True)
-    middle_row.add_column(ratio=1)
-    middle_row.add_row(brief_panel)
-
-    left_ratio = max(2, 8 - clamp_right_column_ratio(right_column_ratio))
-    right_ratio = clamp_right_column_ratio(right_column_ratio)
-    bottom_row = Table.grid(expand=True)
-    bottom_row.add_column(ratio=left_ratio)
-    bottom_row.add_column(ratio=right_ratio)
     if brief_focus:
-        focus_sections: list[Any] = [
-            top_row,
-            brief_panel,
-            render_selected_story_panel(items, selected_index),
-            render_command_panel(command_log, in_command_mode, command_buffer),
-        ]
-        if show_menu:
-            focus_sections.append(render_menu_panel(show_menu))
+        focus_layout = Layout(name="root")
+        focus_layout.split_column(
+            Layout(status_panel, name="top", ratio=clamp_row_ratio(status_row_ratio)),
+            Layout(
+                brief_panel,
+                name="brief",
+                ratio=max(clamp_row_ratio(brief_row_ratio), clamp_row_ratio(body_row_ratio)),
+            ),
+            Layout(warning_bar, name="warnings", size=3),
+        )
         return Panel(
-            Group(*focus_sections),
+            focus_layout,
             title="AI Tracker Terminal",
             border_style="bright_blue",
         )
@@ -1958,20 +2112,47 @@ def build_dashboard(
         if is_refreshing
         else "No items for current filters"
     )
-    right_group = Group(
-        render_selected_story_panel(items, selected_index),
-        render_models_table(models, config.ollama_model, config.model_list_size),
-        render_source_counts(items),
-        render_menu_panel(show_menu),
-        render_command_panel(command_log, in_command_mode, command_buffer),
+    feed_table = render_feed_table(items, config.max_items, empty_message, selected_index)
+    feed_panel = Panel(
+        feed_table,
+        title="Feed",
+        border_style="bright_cyan" if active_section == "feed" else "cyan",
+        padding=(0, 0),
     )
-    bottom_row.add_row(
-        render_feed_table(items, config.max_items, empty_message, selected_index),
-        right_group,
+    right_title, right_content = render_right_section(
+        active_section=active_section,
+        items=items,
+        selected_index=selected_index,
+        models=models,
+        config=config,
+        show_menu=show_menu,
+        command_log=command_log,
+        in_command_mode=in_command_mode,
+        command_buffer=command_buffer,
+    )
+    right_panel = Panel(
+        right_content,
+        title=right_title,
+        border_style="bright_cyan" if active_section in RIGHT_SECTIONS else "cyan",
+        padding=(0, 0),
+    )
+    left_ratio = max(2, 8 - clamp_right_column_ratio(right_column_ratio))
+    right_ratio = clamp_right_column_ratio(right_column_ratio)
+    bottom_layout = Layout(name="bottom")
+    bottom_layout.split_row(
+        Layout(feed_panel, name="feed", ratio=left_ratio),
+        Layout(right_panel, name="right", ratio=right_ratio),
     )
 
+    root_layout = Layout(name="root")
+    root_layout.split_column(
+        Layout(status_panel, name="top", ratio=clamp_row_ratio(status_row_ratio)),
+        Layout(brief_panel, name="brief", ratio=clamp_row_ratio(brief_row_ratio)),
+        Layout(bottom_layout, name="bottom", ratio=clamp_row_ratio(body_row_ratio)),
+        Layout(warning_bar, name="warnings", size=3),
+    )
     return Panel(
-        Group(top_row, middle_row, bottom_row),
+        root_layout,
         title="AI Tracker Terminal",
         border_style="bright_blue",
     )
@@ -2143,13 +2324,17 @@ def run(config: AppConfig, console: Console) -> int:
                 is_refreshing=False,
                 status_message="Completed one-shot run.",
                 command_log=[],
-                show_menu=True,
+                show_menu=False,
                 in_command_mode=False,
                 command_buffer="",
                 selected_index=0,
                 right_column_ratio=3,
                 brief_focus=False,
                 brief_scroll=0,
+                active_section="feed",
+                status_row_ratio=4,
+                brief_row_ratio=5,
+                body_row_ratio=9,
                 terminal_width=console.size.width,
                 terminal_height=console.size.height,
             )
@@ -2166,11 +2351,18 @@ def run(config: AppConfig, console: Console) -> int:
         right_column_ratio=3,
         brief_focus=False,
         brief_scroll=0,
+        active_section="feed",
+        status_row_ratio=4,
+        brief_row_ratio=5,
+        body_row_ratio=9,
         show_menu=False,
         in_command_mode=False,
         command_buffer="",
     )
-    append_command_log(runtime_state, "Press / to enter command mode. Press m for menu, q to quit.")
+    append_command_log(
+        runtime_state,
+        "Press / for commands. Tab cycles sections. +/- resizes rows. q quits.",
+    )
     state_lock = threading.Lock()
     stop_event = threading.Event()
     command_queue: queue.Queue[tuple[str, str]] = queue.Queue()
@@ -2198,6 +2390,10 @@ def run(config: AppConfig, console: Console) -> int:
     initial_right_column_ratio = runtime_state.right_column_ratio
     initial_brief_focus = runtime_state.brief_focus
     initial_brief_scroll = runtime_state.brief_scroll
+    initial_active_section = runtime_state.active_section
+    initial_status_row_ratio = runtime_state.status_row_ratio
+    initial_brief_row_ratio = runtime_state.brief_row_ratio
+    initial_body_row_ratio = runtime_state.body_row_ratio
     with Live(
         build_dashboard(
             config,
@@ -2213,6 +2409,10 @@ def run(config: AppConfig, console: Console) -> int:
             right_column_ratio=initial_right_column_ratio,
             brief_focus=initial_brief_focus,
             brief_scroll=initial_brief_scroll,
+            active_section=initial_active_section,
+            status_row_ratio=initial_status_row_ratio,
+            brief_row_ratio=initial_brief_row_ratio,
+            body_row_ratio=initial_body_row_ratio,
             terminal_width=console.size.width,
             terminal_height=console.size.height,
         ),
@@ -2249,16 +2449,38 @@ def run(config: AppConfig, console: Console) -> int:
                                     break
                                 if lowered == "m":
                                     runtime_state.show_menu = not runtime_state.show_menu
+                                    if runtime_state.show_menu:
+                                        runtime_state.active_section = "menu"
                                     append_command_log(
                                         runtime_state,
-                                        f"menu -> {'visible' if runtime_state.show_menu else 'hidden'}",
+                                        (
+                                            f"menu -> {'visible' if runtime_state.show_menu else 'hidden'} | "
+                                            f"focus -> {runtime_state.active_section}"
+                                        ),
                                     )
                                     continue
                                 if lowered == "b":
                                     runtime_state.brief_focus = not runtime_state.brief_focus
+                                    if runtime_state.brief_focus:
+                                        runtime_state.active_section = "brief"
                                     append_command_log(
                                         runtime_state,
-                                        f"brief_focus -> {runtime_state.brief_focus}",
+                                        (
+                                            f"brief_focus -> {runtime_state.brief_focus} | "
+                                            f"focus -> {runtime_state.active_section}"
+                                        ),
+                                    )
+                                    continue
+                                if event_value == "TAB":
+                                    runtime_state.active_section = cycle_section(
+                                        runtime_state.active_section,
+                                        1,
+                                    )
+                                    continue
+                                if event_value == "SHTAB":
+                                    runtime_state.active_section = cycle_section(
+                                        runtime_state.active_section,
+                                        -1,
                                     )
                                     continue
                                 if event_value == "PGUP":
@@ -2267,11 +2489,13 @@ def run(config: AppConfig, console: Console) -> int:
                                 if event_value == "PGDN":
                                     runtime_state.brief_scroll += 8
                                     continue
-                                if event_value == "UP" and runtime_state.brief_focus:
-                                    runtime_state.brief_scroll = max(0, runtime_state.brief_scroll - 2)
+                                if event_value in {"+", "="}:
+                                    message = adjust_focused_row_height(runtime_state, 1)
+                                    append_command_log(runtime_state, message)
                                     continue
-                                if event_value == "DOWN" and runtime_state.brief_focus:
-                                    runtime_state.brief_scroll += 2
+                                if event_value in {"-", "_"}:
+                                    message = adjust_focused_row_height(runtime_state, -1)
+                                    append_command_log(runtime_state, message)
                                     continue
                                 if event_value == "[":
                                     runtime_state.right_column_ratio = clamp_right_column_ratio(
@@ -2296,14 +2520,34 @@ def run(config: AppConfig, console: Console) -> int:
                                     runtime_state.command_buffer = "/"
                                     runtime_state.status_message = "Command mode active."
                                     continue
-                                if event_value in {"TAB", "DOWN"} or lowered == "j":
+                                if event_value == "UP":
+                                    if runtime_state.active_section == "brief":
+                                        runtime_state.brief_scroll = max(0, runtime_state.brief_scroll - 2)
+                                    else:
+                                        runtime_state.selected_index = cycle_selection(
+                                            runtime_state.selected_index,
+                                            items,
+                                            -1,
+                                        )
+                                    continue
+                                if event_value == "DOWN":
+                                    if runtime_state.active_section == "brief":
+                                        runtime_state.brief_scroll += 2
+                                    else:
+                                        runtime_state.selected_index = cycle_selection(
+                                            runtime_state.selected_index,
+                                            items,
+                                            1,
+                                        )
+                                    continue
+                                if lowered == "j":
                                     runtime_state.selected_index = cycle_selection(
                                         runtime_state.selected_index,
                                         items,
                                         1,
                                     )
                                     continue
-                                if event_value in {"SHTAB", "UP"} or lowered == "k":
+                                if lowered == "k":
                                     runtime_state.selected_index = cycle_selection(
                                         runtime_state.selected_index,
                                         items,
@@ -2379,6 +2623,10 @@ def run(config: AppConfig, console: Console) -> int:
                     right_column_ratio = runtime_state.right_column_ratio
                     brief_focus = runtime_state.brief_focus
                     brief_scroll = runtime_state.brief_scroll
+                    active_section = runtime_state.active_section
+                    status_row_ratio = runtime_state.status_row_ratio
+                    brief_row_ratio = runtime_state.brief_row_ratio
+                    body_row_ratio = runtime_state.body_row_ratio
                     show_menu = runtime_state.show_menu
                     in_command_mode = runtime_state.in_command_mode
                     command_buffer = runtime_state.command_buffer
@@ -2399,6 +2647,10 @@ def run(config: AppConfig, console: Console) -> int:
                         right_column_ratio=right_column_ratio,
                         brief_focus=brief_focus,
                         brief_scroll=brief_scroll,
+                        active_section=active_section,
+                        status_row_ratio=status_row_ratio,
+                        brief_row_ratio=brief_row_ratio,
+                        body_row_ratio=body_row_ratio,
                         terminal_width=console.size.width,
                         terminal_height=console.size.height,
                     )
