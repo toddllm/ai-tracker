@@ -791,7 +791,7 @@ def ollama_editor_brief_markdown(
     ollama_host: str,
     ollama_model: str,
     topics_csv: str,
-    serialized_items: str,
+    context_json: str,
     timeout_seconds: int,
 ) -> dict[str, Any]:
     base = sanitize_ollama_host(ollama_host)
@@ -805,6 +805,10 @@ def ollama_editor_brief_markdown(
     prompt = (
         "You are an AI news editor. Write a detailed markdown briefing from the feed items.\n"
         f"Priority topics: {topic_text}\n"
+        "Use only facts from the CONTEXT JSON below.\n"
+        "Do not use external knowledge, stale priors, or invented metrics.\n"
+        "If a specific number or comparison is missing from context, say 'Not in current feed'.\n"
+        "Never fabricate benchmarks, latency tables, funding numbers, model rankings, or timelines.\n"
         "Output markdown only (no JSON).\n"
         "Use this structure exactly:\n"
         "# AI Briefing\n"
@@ -823,15 +827,16 @@ def ollama_editor_brief_markdown(
         "Use concise paragraphs, bullet lists, and explicit links when available.\n"
         "If useful, include one fenced text block with ASCII-only mini chart(s) or sparkline-style trends.\n"
         "Keep ASCII visuals under 80 characters wide and under 16 lines total.\n"
+        "If context has no reliable numeric comparisons, avoid numeric tables and use qualitative snapshot bullets.\n"
         "Finish with complete sentences; do not cut off the final section.\n"
-        f"Feed items:\n{serialized_items}"
+        f"CONTEXT JSON:\n{context_json}"
     )
     payload = {
         "model": ollama_model,
         "prompt": prompt,
         "stream": False,
         "options": {
-            "temperature": 0.2,
+            "temperature": 0.1,
             "num_predict": 6000,
         },
     }
@@ -861,6 +866,67 @@ def ollama_editor_brief_markdown(
             if normalized:
                 return {"brief_markdown": normalized, "error": ""}
     return {"brief_markdown": normalize_markdown_text(raw_response), "error": ""}
+
+
+def build_editor_context_json(
+    items: list[dict[str, Any]],
+    topics_csv: str,
+    analysis_limit: int,
+) -> str:
+    feed_generated_at = now_utc()
+    topics = parse_keywords(topics_csv)
+    source_mix = Counter(item.get("source", "?") for item in items)
+
+    def serialize_item(item: dict[str, Any], rank: int) -> dict[str, Any]:
+        llm = item.get("llm") or {}
+        published = item.get("published_at")
+        published_iso = (
+            published.isoformat()
+            if isinstance(published, datetime)
+            else normalize_text(item.get("published_at", ""))
+        )
+        return {
+            "rank": rank,
+            "source": item.get("source", "?"),
+            "title": item.get("title", "")[:220],
+            "summary": item.get("summary", "")[:900],
+            "author": item.get("author", "Unknown"),
+            "url": item.get("url", ""),
+            "published_at": published_iso,
+            "age": human_age(published) if isinstance(published, datetime) else "?",
+            "score": round(float(item.get("score", 0.0)), 4),
+            "trend_score": round(float(item.get("trend_score", item.get("score", 0.0))), 4),
+            "llm_summary": llm.get("summary", ""),
+            "llm_reason": llm.get("reason", ""),
+            "llm_relevance": round(float(llm.get("relevance", 0.0)), 2),
+            "llm_novelty": round(float(llm.get("novelty", 0.0)), 2),
+            "llm_impact": round(float(llm.get("impact", 0.0)), 2),
+            "llm_editor_score": round(float(llm.get("editor_score", 0.0)), 2),
+            "llm_freshness_priority": round(float(llm.get("freshness_priority", 0.0)), 2),
+        }
+
+    latest_items = sorted(items, key=lambda item: item["published_at"], reverse=True)
+    ranked_items = sorted(
+        items,
+        key=lambda item: float(item.get("trend_score", item.get("score", 0.0))),
+        reverse=True,
+    )
+
+    cap = max(12, min(40, max(analysis_limit * 2, analysis_limit + 8)))
+    context = {
+        "feed_generated_at_utc": feed_generated_at.isoformat(),
+        "feed_generated_date_utc": feed_generated_at.strftime("%Y-%m-%d"),
+        "priority_topics": topics,
+        "analysis_limit": analysis_limit,
+        "source_mix": dict(sorted(source_mix.items(), key=lambda pair: pair[0])),
+        "latest_items": [serialize_item(item, idx) for idx, item in enumerate(latest_items[:cap], start=1)],
+        "ranked_items": [serialize_item(item, idx) for idx, item in enumerate(ranked_items[:cap], start=1)],
+        "guidance": {
+            "grounding_rule": "Use only context facts; do not invent missing numbers or benchmarks.",
+            "staleness_rule": "Treat feed_generated_at_utc as 'now' for this run.",
+        },
+    }
+    return json.dumps(context, ensure_ascii=True)
 
 
 def apply_ollama_enrichment(
@@ -930,11 +996,16 @@ def apply_ollama_enrichment(
             cloned["llm"] = llm_data
         updated.append(cloned)
 
+    editor_context_json = build_editor_context_json(
+        items=updated,
+        topics_csv=topics_csv,
+        analysis_limit=analysis_limit,
+    )
     editor_brief = ollama_editor_brief_markdown(
         ollama_host=ollama_host,
         ollama_model=ollama_model,
         topics_csv=topics_csv,
-        serialized_items=serialized_payload,
+        context_json=editor_context_json,
         timeout_seconds=timeout_seconds,
     )
     brief_markdown = editor_brief["brief_markdown"] or ranking_result["brief"]

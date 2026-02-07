@@ -13,6 +13,7 @@ It runs as a live terminal dashboard and:
 - generates a long-form Ollama markdown briefing with scroll support in the TUI
 - renders briefing in two columns (main brief + snapshot sidebar fallback)
 - allows optional compact ASCII/TUI-style mini charts in the briefing when useful
+- grounds the snapshot editor with live feed context (ranked/latest items, source mix, links, recency)
 - shows warnings in a compact bottom status bar to preserve feed/brief space
 - ranks by newest or trending
 - supports keyboard navigation and opening story links directly from the TUI
