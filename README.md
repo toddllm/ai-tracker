@@ -11,6 +11,7 @@ It runs as a live terminal dashboard and:
 - keeps a real-time Ollama model list (size-sorted)
 - analyzes top feed items using local Ollama model `gpt-oss:120b` by default
 - generates a long-form Ollama markdown briefing with scroll support in the TUI
+- renders briefing in two columns (main brief + snapshot sidebar fallback)
 - allows optional compact ASCII/TUI-style mini charts in the briefing when useful
 - shows warnings in a compact bottom status bar to preserve feed/brief space
 - ranks by newest or trending

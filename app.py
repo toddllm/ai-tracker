@@ -1218,8 +1218,68 @@ def render_markdown_lines(markdown_text: str, width: int) -> tuple[str, ...]:
     return tuple(rendered.splitlines())
 
 
+def split_brief_columns(markdown_text: str) -> tuple[str, str]:
+    lines = markdown_text.splitlines()
+    start = -1
+    for index, line in enumerate(lines):
+        lowered = line.strip().lower()
+        if lowered.startswith("## tui snapshot") or lowered.startswith("### tui snapshot"):
+            start = index
+            break
+    if start < 0:
+        return markdown_text, ""
+
+    end = len(lines)
+    for index in range(start + 1, len(lines)):
+        stripped = lines[index].strip()
+        if stripped.startswith("# "):
+            end = index
+            break
+        if stripped.startswith("## "):
+            end = index
+            break
+    left = "\n".join(lines[:start] + lines[end:]).strip()
+    right = "\n".join(lines[start:end]).strip()
+    return left or markdown_text, right
+
+
+def build_auto_snapshot_markdown(items: list[dict[str, Any]], max_title: int = 44) -> str:
+    lines: list[str] = ["### Quick Snapshot", ""]
+    if not items:
+        lines.append("- Waiting for first refresh.")
+        lines.append("")
+        lines.append("_LLM snapshot not provided yet._")
+        return "\n".join(lines)
+
+    counts = Counter(item.get("source", "?") for item in items)
+    lines.extend(["#### Source Mix"])
+    for source, count in sorted(counts.items(), key=lambda pair: (-pair[1], pair[0]))[:4]:
+        lines.append(f"- `{source}`: {count}")
+
+    freshest = sorted(items, key=lambda item: item["published_at"], reverse=True)[:3]
+    lines.extend(["", "#### Freshest"])
+    for item in freshest:
+        lines.append(
+            f"- `{human_age(item['published_at'])}` {truncate(item.get('title', '(untitled)'), max_title)}"
+        )
+
+    ranked = sorted(
+        items,
+        key=lambda item: float(item.get("trend_score", item.get("score", 0.0))),
+        reverse=True,
+    )[:3]
+    lines.extend(["", "#### Top Picks"])
+    for idx, item in enumerate(ranked, start=1):
+        score = float(item.get("trend_score", item.get("score", 0.0)))
+        lines.append(f"{idx}. `{score:.2f}` {truncate(item.get('title', '(untitled)'), max_title)}")
+
+    lines.extend(["", "_LLM snapshot not provided; using auto summary._"])
+    return "\n".join(lines)
+
+
 def build_brief_panel(
     llm_brief: str,
+    items: list[dict[str, Any]],
     brief_focus: bool,
     brief_scroll: int,
     terminal_width: int,
@@ -1229,38 +1289,60 @@ def build_brief_panel(
 ) -> tuple[Panel, int, int]:
     border_style = "bright_green" if focused else "green"
     markdown_text = format_llm_brief_markdown(llm_brief)
-    if markdown_text == "_No brief available yet._":
-        return (
-            Panel(Markdown(markdown_text), title="Ollama Brief", border_style=border_style),
-            0,
-            0,
-        )
+    left_markdown, right_markdown = split_brief_columns(markdown_text)
+    content_width = max(70, terminal_width - 12)
+    left_width = max(42, int(content_width * 0.68))
+    right_width = max(26, content_width - left_width - 2)
 
-    content_width = max(
-        50,
-        terminal_width - 12 if brief_focus else (terminal_width // 2) - 10,
-    )
-    rendered_lines = list(render_markdown_lines(markdown_text, content_width))
-    if not rendered_lines:
-        rendered_lines = [""]
+    used_auto_snapshot = False
+    if not right_markdown.strip():
+        used_auto_snapshot = True
+        right_markdown = build_auto_snapshot_markdown(items, max_title=max(20, right_width - 8))
+
+    left_lines = list(render_markdown_lines(left_markdown, left_width))
+    right_lines = list(render_markdown_lines(right_markdown, right_width))
+    if not left_lines:
+        left_lines = [""]
+    if not right_lines:
+        right_lines = [""]
 
     if brief_focus:
-        visible_lines = max(12, min(len(rendered_lines), target_lines))
+        visible_lines = max(12, target_lines)
     else:
-        visible_lines = max(8, min(len(rendered_lines), target_lines))
-    max_scroll = max(0, len(rendered_lines) - visible_lines)
+        visible_lines = max(8, target_lines)
+    if used_auto_snapshot and len(left_lines) <= visible_lines and len(right_lines) > visible_lines:
+        right_lines = right_lines[:visible_lines]
+
+    max_lines = max(len(left_lines), len(right_lines))
+    max_scroll = max(0, max_lines - visible_lines)
     offset = max(0, min(brief_scroll, max_scroll))
-    window = rendered_lines[offset : offset + visible_lines]
-    body = "\n".join(window).rstrip()
+    left_window = left_lines[offset : offset + visible_lines]
+    right_window = right_lines[offset : offset + visible_lines]
+    if len(left_window) < visible_lines:
+        left_window.extend([""] * (visible_lines - len(left_window)))
+    if len(right_window) < visible_lines:
+        right_window.extend([""] * (visible_lines - len(right_window)))
+
+    left_body = "\n".join(left_window).rstrip()
+    right_body = "\n".join(right_window).rstrip()
+
+    if not left_body:
+        left_body = "_No brief available yet._"
+    if not right_body:
+        right_body = "_No snapshot available._"
+
     if max_scroll > 0:
-        line_end = offset + len(window)
-        footer = f"Lines {offset + 1}-{line_end}/{len(rendered_lines)} | PgUp/PgDn scroll"
+        line_end = min(offset + visible_lines, max_lines)
+        footer = f"Lines {offset + 1}-{line_end}/{max_lines} | PgUp/PgDn scroll"
         if brief_focus:
             footer += " | Up/Down scroll in focus mode"
-        if body:
-            body += "\n\n"
-        body += footer
-    return Panel(body, title="Ollama Brief", border_style=border_style), max_scroll, offset
+        left_body = f"{left_body}\n\n{footer}" if left_body else footer
+
+    columns = Table.grid(expand=True)
+    columns.add_column(ratio=68)
+    columns.add_column(ratio=32)
+    columns.add_row(left_body, right_body)
+    return Panel(columns, title="Ollama Brief", border_style=border_style), max_scroll, offset
 
 
 def format_story_markdown(item: dict[str, Any]) -> str:
@@ -2077,6 +2159,7 @@ def build_dashboard(
         estimated_brief_rows = max(12, content_rows - 2)
     brief_panel, max_brief_scroll, clamped_brief_scroll = build_brief_panel(
         llm_brief=llm_brief,
+        items=items,
         brief_focus=brief_focus,
         brief_scroll=brief_scroll,
         terminal_width=terminal_width,
