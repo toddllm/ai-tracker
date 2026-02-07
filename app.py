@@ -90,6 +90,8 @@ class RuntimeState:
     status_message: str
     command_log: list[str]
     selected_index: int
+    right_column_ratio: int
+    brief_focus: bool
     show_menu: bool
     in_command_mode: bool
     command_buffer: str
@@ -889,6 +891,10 @@ def cycle_selection(index: int, items: list[dict[str, Any]], delta: int) -> int:
     return (index + delta) % len(items)
 
 
+def clamp_right_column_ratio(value: int) -> int:
+    return max(2, min(6, value))
+
+
 def open_link(url: str) -> str:
     clean_url = url.strip()
     if not clean_url:
@@ -1195,7 +1201,8 @@ def handle_slash_command(
                 runtime_state,
                 "Commands: /help | /config | /set <key> <value> | /sources <csv> | "
                 "/newsletters <all|csv> | /refresh | /export [md|json|csv] [path] | "
-                "/open [index] | /menu [on|off|toggle] | /clearlog | /quit",
+                "/open [index] | /brief [focus|normal|toggle] | /layout [right 2-6] | "
+                "/menu [on|off|toggle] | /clearlog | /quit",
             )
         return False
 
@@ -1216,6 +1223,40 @@ def handle_slash_command(
             append_command_log(
                 runtime_state,
                 f"menu -> {'visible' if runtime_state.show_menu else 'hidden'}",
+            )
+        return False
+
+    if command == "brief":
+        mode = args[0].lower() if args else "toggle"
+        with state_lock:
+            if mode in {"focus", "on"}:
+                runtime_state.brief_focus = True
+            elif mode in {"normal", "off"}:
+                runtime_state.brief_focus = False
+            else:
+                runtime_state.brief_focus = not runtime_state.brief_focus
+            append_command_log(
+                runtime_state,
+                f"brief_focus -> {runtime_state.brief_focus}",
+            )
+        return False
+
+    if command == "layout":
+        if len(args) >= 2 and args[0].lower() == "right":
+            try:
+                parsed_ratio = clamp_right_column_ratio(int(args[1]))
+            except ValueError:
+                with state_lock:
+                    append_command_log(runtime_state, "Usage: /layout right <2..6>")
+                return False
+            with state_lock:
+                runtime_state.right_column_ratio = parsed_ratio
+                append_command_log(runtime_state, f"right_column_ratio -> {parsed_ratio}")
+            return False
+        with state_lock:
+            append_command_log(
+                runtime_state,
+                "Usage: /layout right <2..6>",
             )
         return False
 
@@ -1506,6 +1547,8 @@ def render_menu_panel(show_menu: bool) -> Panel:
         "- Tab / Shift+Tab : next/prev story\n"
         "- j / k or Down / Up : next/prev story\n"
         "- o : open selected story link\n"
+        "- b : toggle brief focus mode\n"
+        "- [ / ] : resize right column narrower/wider\n"
         "- Esc : cancel command mode\n"
         "- q : quit\n"
         "- m : toggle this menu\n\n"
@@ -1517,6 +1560,8 @@ def render_menu_panel(show_menu: bool) -> Panel:
         "- /newsletters <all|csv>\n"
         "- /refresh\n"
         "- /open [index]\n"
+        "- /brief [focus|normal|toggle]\n"
+        "- /layout right <2..6>\n"
         "- /export [md|json|csv] [path]\n"
         "- /quit"
     )
@@ -1534,6 +1579,8 @@ def build_dashboard(
     in_command_mode: bool,
     command_buffer: str,
     selected_index: int,
+    right_column_ratio: int,
+    brief_focus: bool,
 ) -> Panel:
     started: datetime = cycle_state["started"]
     elapsed_seconds: float = cycle_state["elapsed_seconds"]
@@ -1549,9 +1596,10 @@ def build_dashboard(
         f"Cycle runtime: {elapsed_seconds:.1f}s",
         f"State: {'refreshing' if is_refreshing else 'idle'}",
         f"Message: {status_message}",
-        "Input: / command mode | Tab navigate | Enter/o open | q quit | m menu",
+        "Input: / command mode | Tab navigate | Enter/o open | b brief | [ ] resize | q quit",
         f"Topics: {config.topics or '(none)'}",
         f"Mode: {'strict' if config.strict_topics else 'broad'} | Sort: {config.sort_mode}",
+        f"Layout: right_col={right_column_ratio} | brief_focus={brief_focus}",
         f"Analysis model: {config.ollama_model} | Analysis limit: {config.analysis_limit}",
     ]
     status_panel = Panel("\n".join(status_lines), title="Status", border_style="cyan")
@@ -1579,23 +1627,37 @@ def build_dashboard(
     middle_row.add_column(ratio=1)
     middle_row.add_row(brief_panel)
 
+    left_ratio = max(2, 8 - clamp_right_column_ratio(right_column_ratio))
+    right_ratio = clamp_right_column_ratio(right_column_ratio)
     bottom_row = Table.grid(expand=True)
-    bottom_row.add_column(ratio=4)
-    bottom_row.add_column(ratio=3)
+    bottom_row.add_column(ratio=left_ratio)
+    bottom_row.add_column(ratio=right_ratio)
     empty_message = (
         "Loading first refresh... TUI is active and updates will appear shortly."
         if is_refreshing
         else "No items for current filters"
     )
+    right_group = Group(
+        render_selected_story_panel(items, selected_index),
+        render_models_table(models, config.ollama_model, config.model_list_size),
+        render_source_counts(items),
+        render_menu_panel(show_menu),
+        render_command_panel(command_log, in_command_mode, command_buffer),
+    )
+    if brief_focus:
+        bottom_row.add_row(
+            brief_panel,
+            right_group,
+        )
+        return Panel(
+            Group(top_row, bottom_row),
+            title="AI Tracker Terminal",
+            border_style="bright_blue",
+        )
+
     bottom_row.add_row(
         render_feed_table(items, config.max_items, empty_message, selected_index),
-        Group(
-            render_selected_story_panel(items, selected_index),
-            render_models_table(models, config.ollama_model, config.model_list_size),
-            render_source_counts(items),
-            render_menu_panel(show_menu),
-            render_command_panel(command_log, in_command_mode, command_buffer),
-        ),
+        right_group,
     )
 
     return Panel(
@@ -1769,6 +1831,8 @@ def run(config: AppConfig, console: Console) -> int:
                 in_command_mode=False,
                 command_buffer="",
                 selected_index=0,
+                right_column_ratio=3,
+                brief_focus=False,
             )
         )
         return 0
@@ -1780,6 +1844,8 @@ def run(config: AppConfig, console: Console) -> int:
         status_message="Starting first refresh...",
         command_log=[],
         selected_index=0,
+        right_column_ratio=3,
+        brief_focus=False,
         show_menu=False,
         in_command_mode=False,
         command_buffer="",
@@ -1809,6 +1875,8 @@ def run(config: AppConfig, console: Console) -> int:
     initial_in_command_mode = runtime_state.in_command_mode
     initial_command_buffer = runtime_state.command_buffer
     initial_selected_index = runtime_state.selected_index
+    initial_right_column_ratio = runtime_state.right_column_ratio
+    initial_brief_focus = runtime_state.brief_focus
     with Live(
         build_dashboard(
             config,
@@ -1821,6 +1889,8 @@ def run(config: AppConfig, console: Console) -> int:
             in_command_mode=initial_in_command_mode,
             command_buffer=initial_command_buffer,
             selected_index=initial_selected_index,
+            right_column_ratio=initial_right_column_ratio,
+            brief_focus=initial_brief_focus,
         ),
         console=console,
         refresh_per_second=4,
@@ -1858,6 +1928,31 @@ def run(config: AppConfig, console: Console) -> int:
                                     append_command_log(
                                         runtime_state,
                                         f"menu -> {'visible' if runtime_state.show_menu else 'hidden'}",
+                                    )
+                                    continue
+                                if lowered == "b":
+                                    runtime_state.brief_focus = not runtime_state.brief_focus
+                                    append_command_log(
+                                        runtime_state,
+                                        f"brief_focus -> {runtime_state.brief_focus}",
+                                    )
+                                    continue
+                                if event_value == "[":
+                                    runtime_state.right_column_ratio = clamp_right_column_ratio(
+                                        runtime_state.right_column_ratio - 1
+                                    )
+                                    append_command_log(
+                                        runtime_state,
+                                        f"right_column_ratio -> {runtime_state.right_column_ratio}",
+                                    )
+                                    continue
+                                if event_value == "]":
+                                    runtime_state.right_column_ratio = clamp_right_column_ratio(
+                                        runtime_state.right_column_ratio + 1
+                                    )
+                                    append_command_log(
+                                        runtime_state,
+                                        f"right_column_ratio -> {runtime_state.right_column_ratio}",
                                     )
                                     continue
                                 if event_value == "/":
@@ -1945,6 +2040,8 @@ def run(config: AppConfig, console: Console) -> int:
                     status_message = runtime_state.status_message
                     command_log = list(runtime_state.command_log)
                     selected_index = runtime_state.selected_index
+                    right_column_ratio = runtime_state.right_column_ratio
+                    brief_focus = runtime_state.brief_focus
                     show_menu = runtime_state.show_menu
                     in_command_mode = runtime_state.in_command_mode
                     command_buffer = runtime_state.command_buffer
@@ -1962,6 +2059,8 @@ def run(config: AppConfig, console: Console) -> int:
                         show_menu=show_menu,
                         in_command_mode=in_command_mode,
                         command_buffer=command_buffer,
+                        right_column_ratio=right_column_ratio,
+                        brief_focus=brief_focus,
                     )
                 )
                 time.sleep(1)

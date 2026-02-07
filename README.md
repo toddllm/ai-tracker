@@ -77,6 +77,8 @@ Hotkeys:
 - `Shift+Tab` previous story
 - `j`/`k` or `Down`/`Up` next/previous story
 - `o` open selected story link
+- `b` toggle brief focus mode (makes brief much larger)
+- `[` / `]` resize right-hand panel narrower/wider
 - `Esc` cancel command mode
 - `m` toggle menu
 - `q` quit immediately
@@ -90,6 +92,8 @@ Commands:
 - `/newsletters <all|csv names>` change newsletter set
 - `/refresh` trigger immediate refresh now
 - `/open [index]` open selected story, or a 1-based index
+- `/brief [focus|normal|toggle]` change brief focus mode
+- `/layout right <2..6>` resize right panel via command
 - `/export [md|json|csv] [path]` export current feed snapshot
 - `/menu [on|off|toggle]` show/hide menu panel
 - `/clearlog` clear command log
