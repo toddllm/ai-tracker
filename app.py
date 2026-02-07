@@ -2150,13 +2150,27 @@ def build_dashboard(
         warnings.append(model_error)
     warnings.extend(errors)
     warning_text = render_warning_text(warnings, terminal_width)
+    panel_height = max(10, terminal_height - 2)
 
-    non_brief_rows = 2
-    content_rows = max(12, terminal_height - non_brief_rows)
+    # Reserve headroom for the outer border/subtitle and compute concrete section heights.
+    usable_height = max(10, terminal_height - 4)
     ratio_total = max(1, brief_row_ratio + body_row_ratio)
-    estimated_brief_rows = max(8, int(content_rows * (brief_row_ratio / ratio_total)) - 2)
     if brief_focus:
-        estimated_brief_rows = max(12, content_rows - 2)
+        brief_height = usable_height
+        bottom_height = 0
+    else:
+        if usable_height >= 18:
+            min_brief = 8
+            min_bottom = 8
+        else:
+            min_brief = 5
+            min_bottom = 4
+        proposed_brief = int(round(usable_height * (brief_row_ratio / ratio_total)))
+        max_brief = max(min_brief, usable_height - min_bottom)
+        brief_height = max(min_brief, min(max_brief, proposed_brief))
+        bottom_height = max(min_bottom, usable_height - brief_height)
+
+    estimated_brief_rows = max(4, brief_height - 2)
     brief_panel, max_brief_scroll, clamped_brief_scroll = build_brief_panel(
         llm_brief=llm_brief,
         items=items,
@@ -2199,7 +2213,7 @@ def build_dashboard(
             Layout(
                 brief_panel,
                 name="brief",
-                ratio=max(clamp_row_ratio(brief_row_ratio), clamp_row_ratio(body_row_ratio)),
+                size=brief_height,
             ),
         )
         return Panel(
@@ -2208,6 +2222,7 @@ def build_dashboard(
             border_style="bright_blue",
             subtitle=footer_text,
             subtitle_align="left",
+            height=panel_height,
         )
 
     empty_message = (
@@ -2249,8 +2264,8 @@ def build_dashboard(
 
     root_layout = Layout(name="root")
     root_layout.split_column(
-        Layout(brief_panel, name="brief", ratio=clamp_row_ratio(brief_row_ratio)),
-        Layout(bottom_layout, name="bottom", ratio=clamp_row_ratio(body_row_ratio)),
+        Layout(brief_panel, name="brief", size=brief_height),
+        Layout(bottom_layout, name="bottom", size=bottom_height),
     )
     return Panel(
         root_layout,
@@ -2258,6 +2273,7 @@ def build_dashboard(
         border_style="bright_blue",
         subtitle=footer_text,
         subtitle_align="left",
+        height=panel_height,
     )
 
 
@@ -2522,6 +2538,7 @@ def run(config: AppConfig, console: Console) -> int:
         console=console,
         refresh_per_second=4,
         screen=True,
+        vertical_overflow="crop",
     ) as live:
         try:
             while True:
