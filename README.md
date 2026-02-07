@@ -12,6 +12,7 @@ It runs as a live terminal dashboard and:
 - analyzes top feed items using local Ollama model `gpt-oss:120b` by default
 - generates a long-form Ollama markdown briefing with scroll support in the TUI
 - renders briefing in two columns (main brief + snapshot sidebar fallback)
+- shows a local Ollama chat sidebar in the brief second column (toggleable)
 - allows optional compact ASCII/TUI-style mini charts in the briefing when useful
 - grounds the snapshot editor with live feed context (ranked/latest items, source mix, links, recency)
 - shows warnings in a compact bottom status bar to preserve feed/brief space
@@ -87,6 +88,7 @@ Normal mode hotkeys:
 - `Enter` open selected story link
 - `o` open selected story link
 - `b` toggle brief focus mode (full-width brief reader)
+- `c` toggle local chat sidebar in the brief panel
 - `[` / `]` resize right-hand panel narrower/wider
 - `m` toggle menu panel
 - `q` quit immediately
@@ -122,6 +124,8 @@ Commands:
 - `/layout right <2..6>` resize right panel via command
 - `/export [md|json|csv] [path]` export current feed snapshot
 - `/menu [on|off|toggle]` show/hide menu panel
+- `/ask <question>` ask the local chat assistant using current feed context
+- `/chat [on|off|toggle|model <name|auto>|clear]` control chat visibility/model/history
 - `/clearlog` clear command log
 - `/quit` or `/exit` stop the app
 

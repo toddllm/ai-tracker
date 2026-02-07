@@ -70,6 +70,8 @@ SECTION_ORDER = (
     "commands",
 )
 RIGHT_SECTIONS = {"story", "models", "sources", "menu", "commands"}
+CHAT_SPINNER = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+CHAT_HISTORY_MAX = 20
 
 HTML_TAG_RE = re.compile(r"<[^>]+>")
 WHITESPACE_RE = re.compile(r"\s+")
@@ -111,6 +113,12 @@ class RuntimeState:
     status_row_ratio: int
     brief_row_ratio: int
     body_row_ratio: int
+    show_chat: bool
+    chat_model: str
+    chat_model_auto: bool
+    chat_pending: bool
+    chat_status: str
+    chat_history: list[dict[str, str]]
     show_menu: bool
     in_command_mode: bool
     command_buffer: str
@@ -617,6 +625,190 @@ def fetch_ollama_models(ollama_host: str) -> dict[str, Any]:
 
     models.sort(key=lambda m: (m["size_bytes"], m["name"]), reverse=True)
     return {"models": models, "error": ""}
+
+
+def choose_chat_model(models: list[dict[str, Any]], fallback_model: str) -> str:
+    if not models:
+        return fallback_model
+
+    candidates: list[dict[str, Any]] = []
+    for model in models:
+        name = normalize_text(model.get("name", ""))
+        if not name:
+            continue
+        lowered = name.lower()
+        if "embed" in lowered:
+            continue
+        size_bytes = int(model.get("size_bytes", 0) or 0)
+        size_gb = size_bytes / (1024**3) if size_bytes else 0.0
+        score = 0.0
+        if 4.0 <= size_gb <= 20.0:
+            score += 60.0
+        elif 2.0 <= size_gb < 4.0:
+            score += 45.0
+        elif 20.0 < size_gb <= 32.0:
+            score += 20.0
+        else:
+            score += 5.0
+        if any(token in lowered for token in ("qwen", "llama", "mistral", "gemma", "phi", "gpt-oss")):
+            score += 15.0
+        score -= abs(size_gb - 12.0)
+        candidates.append({"name": name, "score": score, "size_gb": size_gb})
+
+    if not candidates:
+        return fallback_model or models[0]["name"]
+    candidates.sort(key=lambda c: (c["score"], -c["size_gb"], c["name"]), reverse=True)
+    return candidates[0]["name"]
+
+
+def ensure_chat_model(runtime_state: RuntimeState, config: AppConfig) -> None:
+    models = runtime_state.cycle_state.get("models", [])
+    model_names = {m.get("name", "") for m in models}
+    if runtime_state.chat_model and runtime_state.chat_model in model_names:
+        return
+    if not runtime_state.chat_model_auto and runtime_state.chat_model:
+        runtime_state.chat_status = f"Chat model '{runtime_state.chat_model}' not found."
+        return
+    selected = choose_chat_model(models, config.ollama_model)
+    runtime_state.chat_model = selected
+    runtime_state.chat_status = f"Chat model: {selected}" if selected else "Chat model unavailable."
+
+
+def build_chat_context(
+    topics_csv: str,
+    items: list[dict[str, Any]],
+    llm_brief: str,
+) -> str:
+    topics = parse_keywords(topics_csv)
+    latest = sorted(items, key=lambda item: item["published_at"], reverse=True)[:10]
+    context_items: list[dict[str, Any]] = []
+    for item in latest:
+        context_items.append(
+            {
+                "source": item.get("source", "?"),
+                "title": item.get("title", "")[:200],
+                "summary": item.get("summary", "")[:650],
+                "author": item.get("author", "Unknown"),
+                "url": item.get("url", ""),
+                "published_at": item.get("published_at").isoformat()
+                if isinstance(item.get("published_at"), datetime)
+                else "",
+                "age": human_age(item["published_at"]) if isinstance(item.get("published_at"), datetime) else "?",
+                "score": round(float(item.get("trend_score", item.get("score", 0.0))), 4),
+            }
+        )
+
+    payload = {
+        "generated_at_utc": now_utc().isoformat(),
+        "topics": topics,
+        "items": context_items,
+        "brief_excerpt": format_llm_brief_markdown(llm_brief)[:1800] if llm_brief else "",
+    }
+    return json.dumps(payload, ensure_ascii=True)
+
+
+def trim_chat_history(chat_history: list[dict[str, str]], max_entries: int = CHAT_HISTORY_MAX) -> list[dict[str, str]]:
+    if len(chat_history) <= max_entries:
+        return chat_history
+    return chat_history[-max_entries:]
+
+
+def build_chat_prompt(question: str, context_json: str, chat_history: list[dict[str, str]]) -> str:
+    history_lines: list[str] = []
+    for turn in chat_history[-8:]:
+        role = "User" if turn.get("role") == "user" else "Assistant"
+        content = normalize_text(turn.get("content", ""))
+        if not content:
+            continue
+        history_lines.append(f"{role}: {content[:700]}")
+    history_block = "\n".join(history_lines) if history_lines else "(none)"
+
+    return (
+        "You are a local AI desk assistant in a terminal UI.\n"
+        "Answer as a practical editor with concise markdown.\n"
+        "Rules:\n"
+        "- Ground claims in CONTEXT JSON and chat history.\n"
+        "- If the answer is not in context, say so explicitly.\n"
+        "- Use short bullet lists when useful.\n"
+        "- Include links only when present in context.\n"
+        "- Keep response under 220 words.\n\n"
+        f"CHAT HISTORY:\n{history_block}\n\n"
+        f"CONTEXT JSON:\n{context_json}\n\n"
+        f"QUESTION:\n{question.strip()}\n"
+    )
+
+
+def ollama_chat_completion(
+    ollama_host: str,
+    ollama_model: str,
+    prompt: str,
+    timeout_seconds: int,
+) -> tuple[str, str]:
+    base = sanitize_ollama_host(ollama_host)
+    if not base:
+        return "", "Missing Ollama host."
+    if not ollama_model:
+        return "", "No chat model selected."
+    payload = {
+        "model": ollama_model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "temperature": 0.2,
+            "num_predict": 1200,
+        },
+    }
+    try:
+        response = requests.post(
+            f"{base}/api/generate",
+            json=payload,
+            timeout=timeout_seconds,
+        )
+        response.raise_for_status()
+        result = response.json()
+    except requests.RequestException as exc:
+        return "", f"Chat request failed ({normalize_text(str(exc))[:160]})."
+
+    text = normalize_markdown_text(result.get("response", ""))
+    if not text:
+        return "", "Chat response was empty."
+    return text, ""
+
+
+def build_chat_sidebar_markdown(
+    show_chat: bool,
+    chat_model: str,
+    chat_pending: bool,
+    chat_status: str,
+    chat_history: list[dict[str, str]],
+) -> str:
+    if not show_chat:
+        return ""
+
+    spinner = CHAT_SPINNER[int(time.time() * 8) % len(CHAT_SPINNER)] if chat_pending else "•"
+    status = "thinking..." if chat_pending else (chat_status or "ready")
+    lines = [
+        "### Local Chat",
+        f"- Model: `{chat_model or 'unavailable'}`",
+        f"- Status: {spinner} {status}",
+        "- Ask: `/ask <question>`",
+        "- Toggle: `/chat on|off` or `c`",
+        "- Clear: `/chat clear`",
+        "",
+    ]
+    recent = chat_history[-6:]
+    if not recent:
+        lines.append("_No chat yet. Try `/ask what matters most today?`_")
+        return "\n".join(lines)
+
+    for turn in recent:
+        role = turn.get("role", "assistant")
+        label = "You" if role == "user" else "AI"
+        content = normalize_markdown_text(turn.get("content", "")).strip()
+        content = truncate(content.replace("\n", " "), 220)
+        lines.append(f"**{label}:** {content}")
+        lines.append("")
+    return "\n".join(lines).strip()
 
 
 def extract_json_object(raw_text: str) -> dict[str, Any]:
@@ -1351,6 +1543,8 @@ def build_auto_snapshot_markdown(items: list[dict[str, Any]], max_title: int = 4
 def build_brief_panel(
     llm_brief: str,
     items: list[dict[str, Any]],
+    chat_sidebar_markdown: str,
+    show_chat: bool,
     brief_focus: bool,
     brief_scroll: int,
     terminal_width: int,
@@ -1362,13 +1556,16 @@ def build_brief_panel(
     markdown_text = format_llm_brief_markdown(llm_brief)
     left_markdown, right_markdown = split_brief_columns(markdown_text)
     content_width = max(70, terminal_width - 12)
-    left_width = max(42, int(content_width * 0.68))
+    left_width = max(42, int(content_width * 0.66))
     right_width = max(26, content_width - left_width - 2)
 
     used_auto_snapshot = False
-    if not right_markdown.strip():
-        used_auto_snapshot = True
-        right_markdown = build_auto_snapshot_markdown(items, max_title=max(20, right_width - 8))
+    if show_chat:
+        right_markdown = chat_sidebar_markdown.strip() or "### Local Chat\n\n_No chat available._"
+    else:
+        if not right_markdown.strip():
+            used_auto_snapshot = True
+            right_markdown = build_auto_snapshot_markdown(items, max_title=max(20, right_width - 8))
 
     left_lines = list(render_markdown_lines(left_markdown, left_width))
     right_lines = list(render_markdown_lines(right_markdown, right_width))
@@ -1660,6 +1857,7 @@ def handle_slash_command(
     runtime_state: RuntimeState,
     state_lock: threading.Lock,
     stop_event: threading.Event,
+    chat_queue: queue.Queue[str],
 ) -> bool:
     line = raw_line.strip()
     if not line:
@@ -1694,13 +1892,95 @@ def handle_slash_command(
                 "/limit <n> | /refresh | /export [md|json|csv] [path] | "
                 "/open [index] | /brief [focus|normal|toggle|top] | /focus <section> | "
                 "/size <status|brief|body> <1..12> | /layout [right 2-6] | "
-                "/menu [on|off|toggle] | /clearlog | /quit",
+                "/menu [on|off|toggle] | /ask <question> | "
+                "/chat [on|off|toggle|model <name|auto>|clear] | /clearlog | /quit",
             )
         return False
 
     if command == "config":
         with state_lock:
             append_command_log(runtime_state, build_config_summary(config))
+        return False
+
+    if command == "ask":
+        question = " ".join(args).strip()
+        if not question:
+            with state_lock:
+                append_command_log(runtime_state, "Usage: /ask <question>")
+            return False
+        with state_lock:
+            runtime_state.show_chat = True
+            runtime_state.chat_pending = True
+            runtime_state.chat_status = "Queued"
+            runtime_state.chat_history.append({"role": "user", "content": question})
+            runtime_state.chat_history = trim_chat_history(runtime_state.chat_history)
+            append_command_log(runtime_state, f"Queued chat question ({len(question)} chars).")
+        chat_queue.put(question)
+        return False
+
+    if command == "chat":
+        action = args[0].strip().lower() if args else "status"
+        if action in {"on", "off", "toggle"}:
+            with state_lock:
+                if action == "on":
+                    runtime_state.show_chat = True
+                elif action == "off":
+                    runtime_state.show_chat = False
+                else:
+                    runtime_state.show_chat = not runtime_state.show_chat
+                append_command_log(
+                    runtime_state,
+                    f"chat -> {'visible' if runtime_state.show_chat else 'hidden'}",
+                )
+            return False
+
+        if action == "clear":
+            with state_lock:
+                runtime_state.chat_history.clear()
+                runtime_state.chat_status = "Cleared"
+                runtime_state.chat_pending = False
+                append_command_log(runtime_state, "Chat history cleared.")
+            return False
+
+        if action == "model":
+            if len(args) < 2:
+                with state_lock:
+                    append_command_log(runtime_state, "Usage: /chat model <name|auto>")
+                return False
+            requested_model = " ".join(args[1:]).strip()
+            with state_lock:
+                if requested_model.lower() == "auto":
+                    runtime_state.chat_model_auto = True
+                    ensure_chat_model(runtime_state, config)
+                    append_command_log(
+                        runtime_state,
+                        f"chat_model -> auto ({runtime_state.chat_model or 'unavailable'})",
+                    )
+                else:
+                    runtime_state.chat_model_auto = False
+                    runtime_state.chat_model = requested_model
+                    available_names = {
+                        model.get("name", "")
+                        for model in runtime_state.cycle_state.get("models", [])
+                    }
+                    if requested_model in available_names:
+                        runtime_state.chat_status = f"Chat model: {requested_model}"
+                    else:
+                        runtime_state.chat_status = (
+                            f"Chat model set to '{requested_model}' (not in local tags)."
+                        )
+                    append_command_log(runtime_state, f"chat_model -> {requested_model}")
+            return False
+
+        with state_lock:
+            append_command_log(
+                runtime_state,
+                (
+                    f"chat: visible={runtime_state.show_chat}, model={runtime_state.chat_model or 'unavailable'}, "
+                    f"auto={runtime_state.chat_model_auto}, pending={runtime_state.chat_pending}, "
+                    f"turns={len(runtime_state.chat_history)}"
+                ),
+            )
         return False
 
     if command in {"topics", "sort", "lookback", "max", "model", "strict", "limit"}:
@@ -1980,6 +2260,65 @@ def handle_slash_command(
     return False
 
 
+def chat_worker(
+    config: AppConfig,
+    runtime_state: RuntimeState,
+    state_lock: threading.Lock,
+    stop_event: threading.Event,
+    chat_queue: queue.Queue[str],
+) -> None:
+    while not stop_event.is_set():
+        try:
+            question = chat_queue.get(timeout=0.25)
+        except queue.Empty:
+            continue
+        question = question.strip()
+        if not question:
+            continue
+
+        with state_lock:
+            ensure_chat_model(runtime_state, config)
+            model = runtime_state.chat_model
+            history = list(runtime_state.chat_history)
+            items_snapshot = copy.deepcopy(runtime_state.cycle_state.get("items", []))
+            llm_brief = runtime_state.cycle_state.get("llm_brief", "")
+            topics = config.topics
+            ollama_host = config.ollama_host
+            timeout_seconds = config.ollama_timeout_seconds
+            runtime_state.chat_pending = True
+            runtime_state.chat_status = "Thinking..."
+
+        context_json = build_chat_context(
+            topics_csv=topics,
+            items=items_snapshot,
+            llm_brief=llm_brief,
+        )
+        prompt = build_chat_prompt(
+            question=question,
+            context_json=context_json,
+            chat_history=history,
+        )
+        answer, error = ollama_chat_completion(
+            ollama_host=ollama_host,
+            ollama_model=model,
+            prompt=prompt,
+            timeout_seconds=max(30, min(timeout_seconds, 240)),
+        )
+
+        with state_lock:
+            if error:
+                runtime_state.chat_status = error
+                runtime_state.chat_history.append(
+                    {"role": "assistant", "content": f"Error: {error}"}
+                )
+                append_command_log(runtime_state, f"Chat failed: {error}")
+            else:
+                runtime_state.chat_status = f"Answered at {now_utc().strftime('%H:%M:%S UTC')}"
+                runtime_state.chat_history.append({"role": "assistant", "content": answer})
+            runtime_state.chat_history = trim_chat_history(runtime_state.chat_history)
+            runtime_state.chat_pending = False
+
+
 def refresh_worker(
     config: AppConfig,
     runtime_state: RuntimeState,
@@ -2003,6 +2342,7 @@ def refresh_worker(
 
         with state_lock:
             runtime_state.cycle_state = cycle_state
+            ensure_chat_model(runtime_state, config)
             runtime_state.selected_index = clamp_selection(
                 runtime_state.selected_index,
                 runtime_state.cycle_state.get("items", []),
@@ -2134,6 +2474,7 @@ def render_menu_panel(show_menu: bool) -> Panel:
         "- + / - : grow/shrink focused row\n"
         "- o : open selected story link\n"
         "- b : toggle brief focus mode\n"
+        "- c : toggle chat sidebar in brief panel\n"
         "- [ / ] : resize right column narrower/wider\n"
         "- Esc : cancel command mode\n"
         "- q : quit\n"
@@ -2160,6 +2501,8 @@ def render_menu_panel(show_menu: bool) -> Panel:
         "- /layout right <2..6>\n"
         "- /export [md|json|csv] [path]\n"
         "- /menu [on|off|toggle]\n"
+        "- /ask <question>\n"
+        "- /chat [on|off|toggle|model <name|auto>|clear]\n"
         "- /clearlog\n"
         "- /quit"
     )
@@ -2192,7 +2535,7 @@ def render_command_bar(
         return Text(truncate(text, max_chars), style="bold magenta")
     hint = (
         "Slash: /help /config /topics <csv> /sources <csv> /newsletters <all|csv> "
-        "/sort <newest|trending> /refresh /export /quit"
+        "/sort <newest|trending> /ask <question> /chat on|off /refresh /export /quit"
     )
     return Text(truncate(hint, max_chars), style="magenta")
 
@@ -2259,6 +2602,11 @@ def build_dashboard(
     status_row_ratio: int,
     brief_row_ratio: int,
     body_row_ratio: int,
+    show_chat: bool,
+    chat_model: str,
+    chat_pending: bool,
+    chat_status: str,
+    chat_history: list[dict[str, str]],
     terminal_width: int,
     terminal_height: int,
 ) -> Panel:
@@ -2301,9 +2649,19 @@ def build_dashboard(
         bottom_height = max(min_bottom, usable_height - brief_height)
 
     estimated_brief_rows = max(4, brief_height - 2)
+    chat_sidebar_markdown = build_chat_sidebar_markdown(
+        show_chat=show_chat,
+        chat_model=chat_model,
+        chat_pending=chat_pending,
+        chat_status=chat_status,
+        chat_history=chat_history,
+    )
+
     brief_panel, max_brief_scroll, clamped_brief_scroll = build_brief_panel(
         llm_brief=llm_brief,
         items=items,
+        chat_sidebar_markdown=chat_sidebar_markdown,
+        show_chat=show_chat,
         brief_focus=brief_focus,
         brief_scroll=brief_scroll,
         terminal_width=terminal_width,
@@ -2323,7 +2681,7 @@ def build_dashboard(
         f"Topics: {topics_short} | Rows={status_row_ratio}:{brief_row_ratio}:{body_row_ratio} | "
         f"Right={right_column_ratio} | Brief={clamped_brief_scroll}/{max_brief_scroll} | "
         f"Model={config.ollama_model} | Limit={config.analysis_limit} | "
-        "Hotkeys: Tab section, j/k stories, PgUp/PgDn brief, +/- row size, [ ] width, q quit"
+        "Hotkeys: Tab section, j/k stories, PgUp/PgDn brief, +/- row size, [ ] width, c chat, q quit"
     )
     status_lines = [
         truncate(status_line_1, max(60, terminal_width - 12)),
@@ -2586,6 +2944,11 @@ def run(config: AppConfig, console: Console) -> int:
                 status_row_ratio=2,
                 brief_row_ratio=8,
                 body_row_ratio=7,
+                show_chat=True,
+                chat_model=config.ollama_model,
+                chat_pending=False,
+                chat_status="One-shot mode",
+                chat_history=[],
                 terminal_width=console.size.width,
                 terminal_height=console.size.height,
             )
@@ -2606,6 +2969,12 @@ def run(config: AppConfig, console: Console) -> int:
         status_row_ratio=2,
         brief_row_ratio=8,
         body_row_ratio=7,
+        show_chat=True,
+        chat_model="",
+        chat_model_auto=True,
+        chat_pending=False,
+        chat_status="Waiting for model list...",
+        chat_history=[],
         show_menu=False,
         in_command_mode=False,
         command_buffer="",
@@ -2617,6 +2986,7 @@ def run(config: AppConfig, console: Console) -> int:
     state_lock = threading.Lock()
     stop_event = threading.Event()
     command_queue: queue.Queue[tuple[str, str]] = queue.Queue()
+    chat_queue: queue.Queue[str] = queue.Queue()
 
     worker = threading.Thread(
         target=refresh_worker,
@@ -2630,6 +3000,12 @@ def run(config: AppConfig, console: Console) -> int:
         daemon=True,
     )
     command_worker.start()
+    chat_thread = threading.Thread(
+        target=chat_worker,
+        args=(config, runtime_state, state_lock, stop_event, chat_queue),
+        daemon=True,
+    )
+    chat_thread.start()
 
     last_model_poll_at = now_utc()
     initial_snapshot = copy.deepcopy(runtime_state.cycle_state)
@@ -2645,6 +3021,11 @@ def run(config: AppConfig, console: Console) -> int:
     initial_status_row_ratio = runtime_state.status_row_ratio
     initial_brief_row_ratio = runtime_state.brief_row_ratio
     initial_body_row_ratio = runtime_state.body_row_ratio
+    initial_show_chat = runtime_state.show_chat
+    initial_chat_model = runtime_state.chat_model
+    initial_chat_pending = runtime_state.chat_pending
+    initial_chat_status = runtime_state.chat_status
+    initial_chat_history = list(runtime_state.chat_history)
     with Live(
         build_dashboard(
             config,
@@ -2664,6 +3045,11 @@ def run(config: AppConfig, console: Console) -> int:
             status_row_ratio=initial_status_row_ratio,
             brief_row_ratio=initial_brief_row_ratio,
             body_row_ratio=initial_body_row_ratio,
+            show_chat=initial_show_chat,
+            chat_model=initial_chat_model,
+            chat_pending=initial_chat_pending,
+            chat_status=initial_chat_status,
+            chat_history=initial_chat_history,
             terminal_width=console.size.width,
             terminal_height=console.size.height,
         ),
@@ -2721,6 +3107,13 @@ def run(config: AppConfig, console: Console) -> int:
                                             f"brief_focus -> {runtime_state.brief_focus} | "
                                             f"focus -> {runtime_state.active_section}"
                                         ),
+                                    )
+                                    continue
+                                if lowered == "c":
+                                    runtime_state.show_chat = not runtime_state.show_chat
+                                    append_command_log(
+                                        runtime_state,
+                                        f"chat -> {'visible' if runtime_state.show_chat else 'hidden'}",
                                     )
                                     continue
                                 if event_value == "TAB":
@@ -2848,6 +3241,7 @@ def run(config: AppConfig, console: Console) -> int:
                             runtime_state,
                             state_lock,
                             stop_event,
+                            chat_queue,
                         ):
                             exit_requested = True
                             break
@@ -2863,6 +3257,7 @@ def run(config: AppConfig, console: Console) -> int:
                     with state_lock:
                         runtime_state.cycle_state["models"] = models_result["models"]
                         runtime_state.cycle_state["model_error"] = models_result["error"]
+                        ensure_chat_model(runtime_state, config)
                     last_model_poll_at = now
 
                 with state_lock:
@@ -2882,6 +3277,11 @@ def run(config: AppConfig, console: Console) -> int:
                     show_menu = runtime_state.show_menu
                     in_command_mode = runtime_state.in_command_mode
                     command_buffer = runtime_state.command_buffer
+                    show_chat = runtime_state.show_chat
+                    chat_model = runtime_state.chat_model
+                    chat_pending = runtime_state.chat_pending
+                    chat_status = runtime_state.chat_status
+                    chat_history = list(runtime_state.chat_history)
 
                 seconds_to_next = max(0, int((next_run_at - now).total_seconds()))
                 live.update(
@@ -2903,6 +3303,11 @@ def run(config: AppConfig, console: Console) -> int:
                         status_row_ratio=status_row_ratio,
                         brief_row_ratio=brief_row_ratio,
                         body_row_ratio=body_row_ratio,
+                        show_chat=show_chat,
+                        chat_model=chat_model,
+                        chat_pending=chat_pending,
+                        chat_status=chat_status,
+                        chat_history=chat_history,
                         terminal_width=console.size.width,
                         terminal_height=console.size.height,
                     )
@@ -2912,6 +3317,7 @@ def run(config: AppConfig, console: Console) -> int:
             stop_event.set()
             worker.join(timeout=2)
             command_worker.join(timeout=2)
+            chat_thread.join(timeout=2)
 
 
 def main(argv: list[str] | None = None) -> int:
