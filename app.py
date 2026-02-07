@@ -36,6 +36,7 @@ from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
 
 ARXIV_API_URL = "https://export.arxiv.org/api/query"
 X_SEARCH_ENDPOINTS = [
@@ -1972,14 +1973,9 @@ def render_menu_panel(show_menu: bool) -> Panel:
     return Panel(body, title="Menu", border_style="blue")
 
 
-def render_warning_bar(warnings: list[str], terminal_width: int) -> Panel:
+def render_warning_bar(warnings: list[str], terminal_width: int) -> Text:
     if not warnings:
-        return Panel(
-            "Warnings: none",
-            title="Warnings",
-            border_style="yellow",
-            padding=(0, 1),
-        )
+        return Text("Warnings: none", style="yellow")
     clean = [normalize_text(warn) for warn in warnings if normalize_text(warn)]
     if not clean:
         clean = ["Unknown warning"]
@@ -1989,12 +1985,7 @@ def render_warning_bar(warnings: list[str], terminal_width: int) -> Panel:
         text += f" | (+{len(clean) - 2} more)"
     max_chars = max(40, terminal_width - 24)
     text = truncate(text, max_chars)
-    return Panel(
-        text,
-        title="Warnings",
-        border_style="yellow",
-        padding=(0, 1),
-    )
+    return Text(f"Warnings: {text}", style="yellow")
 
 
 def render_right_section(
@@ -2064,19 +2055,21 @@ def build_dashboard(
     )
 
     topics_short = truncate(config.topics or "(none)", 64)
+    status_line_1 = (
+        f"Refresh: {started.strftime('%Y-%m-%d %H:%M:%S UTC')} | Next: {seconds_to_next_run}s | "
+        f"Cycle: {elapsed_seconds:.1f}s | State: {'refreshing' if is_refreshing else 'idle'} | "
+        f"Focus: {active_section} | Mode: {'strict' if config.strict_topics else 'broad'} | "
+        f"Sort: {config.sort_mode}"
+    )
+    status_line_2 = (
+        f"Topics: {topics_short} | Rows={status_row_ratio}:{brief_row_ratio}:{body_row_ratio} | "
+        f"Right={right_column_ratio} | Brief={clamped_brief_scroll}/{max_brief_scroll} | "
+        f"Model={config.ollama_model} | Limit={config.analysis_limit} | "
+        "Hotkeys: Tab section, j/k stories, PgUp/PgDn brief, +/- row size, [ ] width, q quit"
+    )
     status_lines = [
-        (
-            f"Refresh: {started.strftime('%Y-%m-%d %H:%M:%S UTC')} | Next: {seconds_to_next_run}s | "
-            f"Cycle: {elapsed_seconds:.1f}s | State: {'refreshing' if is_refreshing else 'idle'} | "
-            f"Focus: {active_section} | Mode: {'strict' if config.strict_topics else 'broad'} | "
-            f"Sort: {config.sort_mode}"
-        ),
-        (
-            f"Topics: {topics_short} | Rows={status_row_ratio}:{brief_row_ratio}:{body_row_ratio} | "
-            f"Right={right_column_ratio} | Brief={clamped_brief_scroll}/{max_brief_scroll} | "
-            f"Model={config.ollama_model} | Limit={config.analysis_limit} | "
-            "Hotkeys: Tab section, j/k stories, PgUp/PgDn brief, +/- row size, [ ] width, q quit"
-        ),
+        truncate(status_line_1, max(60, terminal_width - 12)),
+        truncate(status_line_2, max(60, terminal_width - 12)),
     ]
     status_panel = Panel(
         "\n".join(status_lines),
@@ -2099,7 +2092,7 @@ def build_dashboard(
                 name="brief",
                 ratio=max(clamp_row_ratio(brief_row_ratio), clamp_row_ratio(body_row_ratio)),
             ),
-            Layout(warning_bar, name="warnings", size=3),
+            Layout(warning_bar, name="warnings", size=1),
         )
         return Panel(
             focus_layout,
@@ -2149,7 +2142,7 @@ def build_dashboard(
         Layout(status_panel, name="top", ratio=clamp_row_ratio(status_row_ratio)),
         Layout(brief_panel, name="brief", ratio=clamp_row_ratio(brief_row_ratio)),
         Layout(bottom_layout, name="bottom", ratio=clamp_row_ratio(body_row_ratio)),
-        Layout(warning_bar, name="warnings", size=3),
+        Layout(warning_bar, name="warnings", size=1),
     )
     return Panel(
         root_layout,
