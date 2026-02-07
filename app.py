@@ -1973,9 +1973,9 @@ def render_menu_panel(show_menu: bool) -> Panel:
     return Panel(body, title="Menu", border_style="blue")
 
 
-def render_warning_bar(warnings: list[str], terminal_width: int) -> Text:
+def render_warning_text(warnings: list[str], terminal_width: int) -> str:
     if not warnings:
-        return Text("Warnings: none", style="yellow")
+        return "Warnings: none"
     clean = [normalize_text(warn) for warn in warnings if normalize_text(warn)]
     if not clean:
         clean = ["Unknown warning"]
@@ -1985,12 +1985,13 @@ def render_warning_bar(warnings: list[str], terminal_width: int) -> Text:
         text += f" | (+{len(clean) - 2} more)"
     max_chars = max(40, terminal_width - 24)
     text = truncate(text, max_chars)
-    return Text(f"Warnings: {text}", style="yellow")
+    return f"Warnings: {text}"
 
 
 def render_status_bar(
     line_one: str,
     line_two: str,
+    warning_text: str,
     active_section: str,
     terminal_width: int,
     status_row_ratio: int,
@@ -2001,9 +2002,13 @@ def render_status_bar(
     style = "bright_cyan" if active_section == "status" else "cyan"
     line_count = 1 if status_row_ratio <= 4 else 2
     if line_count == 1:
-        merged = truncate(f"{first} | {second}", max_chars)
+        if warning_text != "Warnings: none":
+            merged = truncate(f"{warning_text} | {first}", max_chars)
+        else:
+            merged = truncate(f"{first} | {second}", max_chars)
+        merged = merged.rstrip(" |")
         return Text(f"Status: {merged}", style=style), line_count
-    return Text(f"Status: {first}\n{second}", style=style), line_count
+    return Text(f"Status: {first}\n{truncate(f'{second} | {warning_text}', max_chars)}", style=style), line_count
 
 
 def render_right_section(
@@ -2089,19 +2094,19 @@ def build_dashboard(
         truncate(status_line_1, max(60, terminal_width - 12)),
         truncate(status_line_2, max(60, terminal_width - 12)),
     ]
-    status_bar, status_bar_height = render_status_bar(
-        line_one=status_lines[0],
-        line_two=status_lines[1],
-        active_section=active_section,
-        terminal_width=terminal_width,
-        status_row_ratio=status_row_ratio,
-    )
-
     warnings: list[str] = []
     if model_error:
         warnings.append(model_error)
     warnings.extend(errors)
-    warning_bar = render_warning_bar(warnings, terminal_width)
+    warning_text = render_warning_text(warnings, terminal_width)
+    status_bar, status_bar_height = render_status_bar(
+        line_one=status_lines[0],
+        line_two=status_lines[1],
+        warning_text=warning_text,
+        active_section=active_section,
+        terminal_width=terminal_width,
+        status_row_ratio=status_row_ratio,
+    )
 
     if brief_focus:
         focus_layout = Layout(name="root")
@@ -2112,7 +2117,6 @@ def build_dashboard(
                 ratio=max(clamp_row_ratio(brief_row_ratio), clamp_row_ratio(body_row_ratio)),
             ),
             Layout(status_bar, name="status", size=status_bar_height),
-            Layout(warning_bar, name="warnings", size=1),
         )
         return Panel(
             focus_layout,
@@ -2162,7 +2166,6 @@ def build_dashboard(
         Layout(brief_panel, name="brief", ratio=clamp_row_ratio(brief_row_ratio)),
         Layout(bottom_layout, name="bottom", ratio=clamp_row_ratio(body_row_ratio)),
         Layout(status_bar, name="status", size=status_bar_height),
-        Layout(warning_bar, name="warnings", size=1),
     )
     return Panel(
         root_layout,
