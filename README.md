@@ -77,6 +77,7 @@ python app.py --sources newsletters --strict-topics --topics "agents, multimodal
 Normal mode hotkeys:
 
 - `/` enter command mode
+- bottom line shows slash-command hint/input at all times
 - `Tab` cycle focused section (`status`, `brief`, `feed`, `story`, `models`, `sources`, `menu`, `commands`)
 - `Shift+Tab` cycle focused section backwards
 - `j`/`k` next/previous story
@@ -103,6 +104,13 @@ Commands:
 
 - `/help` show command list
 - `/config` show active runtime config
+- `/topics <csv>` set topics quickly
+- `/sort <newest|trending>` change sorting quickly
+- `/lookback <days>` set lookback window quickly
+- `/max <items>` set item cap quickly
+- `/model <name>` set Ollama model quickly
+- `/strict <on|off>` toggle strict topic mode quickly
+- `/limit <n>` set analysis limit quickly
 - `/set <key> <value>` update settings live
 - `/sources <newsletters,arxiv,x>` change sources
 - `/newsletters <all|csv names>` change newsletter set

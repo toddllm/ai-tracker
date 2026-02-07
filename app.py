@@ -1689,7 +1689,9 @@ def handle_slash_command(
             append_command_log(
                 runtime_state,
                 "Commands: /help | /config | /set <key> <value> | /sources <csv> | "
-                "/newsletters <all|csv> | /refresh | /export [md|json|csv] [path] | "
+                "/newsletters <all|csv> | /topics <csv> | /sort <newest|trending> | "
+                "/lookback <days> | /max <items> | /model <name> | /strict <on|off> | "
+                "/limit <n> | /refresh | /export [md|json|csv] [path] | "
                 "/open [index] | /brief [focus|normal|toggle|top] | /focus <section> | "
                 "/size <status|brief|body> <1..12> | /layout [right 2-6] | "
                 "/menu [on|off|toggle] | /clearlog | /quit",
@@ -1699,6 +1701,34 @@ def handle_slash_command(
     if command == "config":
         with state_lock:
             append_command_log(runtime_state, build_config_summary(config))
+        return False
+
+    if command in {"topics", "sort", "lookback", "max", "model", "strict", "limit"}:
+        key_map = {
+            "topics": "topics",
+            "sort": "sort",
+            "lookback": "lookback_days",
+            "max": "max_items",
+            "model": "ollama_model",
+            "strict": "strict_topics",
+            "limit": "analysis_limit",
+        }
+        if not args:
+            with state_lock:
+                append_command_log(
+                    runtime_state,
+                    f"Usage: /{command} <value>",
+                )
+            return False
+        value = " ".join(args).strip()
+        key = key_map[command]
+        try:
+            with state_lock:
+                message = set_config_value(config, key, value)
+                append_command_log(runtime_state, message)
+        except Exception as exc:
+            with state_lock:
+                append_command_log(runtime_state, f"{command} failed: {exc}")
         return False
 
     if command == "menu":
@@ -2108,9 +2138,17 @@ def render_menu_panel(show_menu: bool) -> Panel:
         "- Esc : cancel command mode\n"
         "- q : quit\n"
         "- m : toggle this menu\n\n"
+        "Bottom bar always shows slash command usage and current input.\n\n"
         "Slash commands:\n"
         "- /help\n"
         "- /config\n"
+        "- /topics <csv>\n"
+        "- /sort <newest|trending>\n"
+        "- /lookback <days>\n"
+        "- /max <items>\n"
+        "- /model <name>\n"
+        "- /strict <on|off>\n"
+        "- /limit <n>\n"
         "- /set <key> <value>\n"
         "- /sources <newsletters,arxiv,x>\n"
         "- /newsletters <all|csv>\n"
@@ -2141,6 +2179,22 @@ def render_warning_text(warnings: list[str], terminal_width: int) -> str:
     max_chars = max(40, terminal_width - 24)
     text = truncate(text, max_chars)
     return f"Warnings: {text}"
+
+
+def render_command_bar(
+    in_command_mode: bool,
+    command_buffer: str,
+    terminal_width: int,
+) -> Text:
+    max_chars = max(40, terminal_width - 4)
+    if in_command_mode:
+        text = f"Command: {command_buffer}   Enter submit | Esc cancel"
+        return Text(truncate(text, max_chars), style="bold magenta")
+    hint = (
+        "Slash: /help /config /topics <csv> /sources <csv> /newsletters <all|csv> "
+        "/sort <newest|trending> /refresh /export /quit"
+    )
+    return Text(truncate(hint, max_chars), style="magenta")
 
 
 def render_footer_text(
@@ -2221,10 +2275,15 @@ def build_dashboard(
         warnings.append(model_error)
     warnings.extend(errors)
     warning_text = render_warning_text(warnings, terminal_width)
+    command_bar = render_command_bar(
+        in_command_mode=in_command_mode,
+        command_buffer=command_buffer,
+        terminal_width=terminal_width,
+    )
     panel_height = max(10, terminal_height - 2)
 
     # Reserve headroom for the outer border/subtitle and compute concrete section heights.
-    usable_height = max(10, terminal_height - 4)
+    usable_height = max(9, terminal_height - 5)
     ratio_total = max(1, brief_row_ratio + body_row_ratio)
     if brief_focus:
         brief_height = usable_height
@@ -2286,6 +2345,7 @@ def build_dashboard(
                 name="brief",
                 size=brief_height,
             ),
+            Layout(command_bar, name="command", size=1),
         )
         return Panel(
             focus_layout,
@@ -2337,6 +2397,7 @@ def build_dashboard(
     root_layout.split_column(
         Layout(brief_panel, name="brief", size=brief_height),
         Layout(bottom_layout, name="bottom", size=bottom_height),
+        Layout(command_bar, name="command", size=1),
     )
     return Panel(
         root_layout,
