@@ -817,8 +817,12 @@ def ollama_editor_brief_markdown(
         "## Editor Notes\n"
         "- Why this matters now\n"
         "- What to watch next\n"
+        "## TUI Snapshot (optional)\n"
+        "- Optional compact ASCII chart/table if it adds value\n"
         "Length target: 500-1400 words.\n"
         "Use concise paragraphs, bullet lists, and explicit links when available.\n"
+        "If useful, include one fenced text block with ASCII-only mini chart(s) or sparkline-style trends.\n"
+        "Keep ASCII visuals under 80 characters wide and under 16 lines total.\n"
         "Finish with complete sentences; do not cut off the final section.\n"
         f"Feed items:\n{serialized_items}"
     )
@@ -1220,6 +1224,7 @@ def build_brief_panel(
     brief_scroll: int,
     terminal_width: int,
     terminal_height: int,
+    target_lines: int,
     focused: bool = False,
 ) -> tuple[Panel, int, int]:
     border_style = "bright_green" if focused else "green"
@@ -1239,25 +1244,22 @@ def build_brief_panel(
     if not rendered_lines:
         rendered_lines = [""]
 
-    visible_lines = (
-        max(10, terminal_height - 18)
-        if brief_focus
-        else max(6, min(18, terminal_height // 4))
-    )
+    if brief_focus:
+        visible_lines = max(12, min(len(rendered_lines), target_lines))
+    else:
+        visible_lines = max(8, min(len(rendered_lines), target_lines))
     max_scroll = max(0, len(rendered_lines) - visible_lines)
     offset = max(0, min(brief_scroll, max_scroll))
     window = rendered_lines[offset : offset + visible_lines]
-    line_end = offset + len(window)
-    footer = f"Lines {offset + 1}-{line_end}/{len(rendered_lines)}"
+    body = "\n".join(window).rstrip()
     if max_scroll > 0:
-        footer += " | PgUp/PgDn scroll"
+        line_end = offset + len(window)
+        footer = f"Lines {offset + 1}-{line_end}/{len(rendered_lines)} | PgUp/PgDn scroll"
         if brief_focus:
             footer += " | Up/Down scroll in focus mode"
-
-    body = "\n".join(window).rstrip()
-    if body:
-        body += "\n\n"
-    body += footer
+        if body:
+            body += "\n\n"
+        body += footer
     return Panel(body, title="Ollama Brief", border_style=border_style), max_scroll, offset
 
 
@@ -2006,7 +2008,7 @@ def render_status_bar(
             merged = truncate(f"{warning_text} | {first}", max_chars)
         else:
             merged = truncate(f"{first} | {second}", max_chars)
-        merged = merged.rstrip(" |")
+        merged = re.sub(r"\s*\|\s*$", "", merged)
         return Text(f"Status: {merged}", style=style), line_count
     return Text(f"Status: {first}\n{truncate(f'{second} | {warning_text}', max_chars)}", style=style), line_count
 
@@ -2068,12 +2070,26 @@ def build_dashboard(
     models: list[dict[str, Any]] = cycle_state["models"]
     model_error: str = cycle_state["model_error"]
 
+    warnings: list[str] = []
+    if model_error:
+        warnings.append(model_error)
+    warnings.extend(errors)
+    warning_text = render_warning_text(warnings, terminal_width)
+
+    status_bar_height = 1 if status_row_ratio <= 4 else 2
+    non_brief_rows = max(3, status_bar_height + 2)
+    content_rows = max(12, terminal_height - non_brief_rows)
+    ratio_total = max(1, brief_row_ratio + body_row_ratio)
+    estimated_brief_rows = max(8, int(content_rows * (brief_row_ratio / ratio_total)) - 2)
+    if brief_focus:
+        estimated_brief_rows = max(12, content_rows - 2)
     brief_panel, max_brief_scroll, clamped_brief_scroll = build_brief_panel(
         llm_brief=llm_brief,
         brief_focus=brief_focus,
         brief_scroll=brief_scroll,
         terminal_width=terminal_width,
         terminal_height=terminal_height,
+        target_lines=estimated_brief_rows,
         focused=(active_section == "brief"),
     )
 
@@ -2094,11 +2110,6 @@ def build_dashboard(
         truncate(status_line_1, max(60, terminal_width - 12)),
         truncate(status_line_2, max(60, terminal_width - 12)),
     ]
-    warnings: list[str] = []
-    if model_error:
-        warnings.append(model_error)
-    warnings.extend(errors)
-    warning_text = render_warning_text(warnings, terminal_width)
     status_bar, status_bar_height = render_status_bar(
         line_one=status_lines[0],
         line_two=status_lines[1],
