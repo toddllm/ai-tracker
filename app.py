@@ -1988,6 +1988,24 @@ def render_warning_bar(warnings: list[str], terminal_width: int) -> Text:
     return Text(f"Warnings: {text}", style="yellow")
 
 
+def render_status_bar(
+    line_one: str,
+    line_two: str,
+    active_section: str,
+    terminal_width: int,
+    status_row_ratio: int,
+) -> tuple[Text, int]:
+    max_chars = max(60, terminal_width - 4)
+    first = truncate(line_one, max_chars)
+    second = truncate(line_two, max_chars)
+    style = "bright_cyan" if active_section == "status" else "cyan"
+    line_count = 1 if status_row_ratio <= 4 else 2
+    if line_count == 1:
+        merged = truncate(f"{first} | {second}", max_chars)
+        return Text(f"Status: {merged}", style=style), line_count
+    return Text(f"Status: {first}\n{second}", style=style), line_count
+
+
 def render_right_section(
     active_section: str,
     items: list[dict[str, Any]],
@@ -2071,10 +2089,12 @@ def build_dashboard(
         truncate(status_line_1, max(60, terminal_width - 12)),
         truncate(status_line_2, max(60, terminal_width - 12)),
     ]
-    status_panel = Panel(
-        "\n".join(status_lines),
-        title="Status",
-        border_style="bright_cyan" if active_section == "status" else "cyan",
+    status_bar, status_bar_height = render_status_bar(
+        line_one=status_lines[0],
+        line_two=status_lines[1],
+        active_section=active_section,
+        terminal_width=terminal_width,
+        status_row_ratio=status_row_ratio,
     )
 
     warnings: list[str] = []
@@ -2086,12 +2106,12 @@ def build_dashboard(
     if brief_focus:
         focus_layout = Layout(name="root")
         focus_layout.split_column(
-            Layout(status_panel, name="top", ratio=clamp_row_ratio(status_row_ratio)),
             Layout(
                 brief_panel,
                 name="brief",
                 ratio=max(clamp_row_ratio(brief_row_ratio), clamp_row_ratio(body_row_ratio)),
             ),
+            Layout(status_bar, name="status", size=status_bar_height),
             Layout(warning_bar, name="warnings", size=1),
         )
         return Panel(
@@ -2139,9 +2159,9 @@ def build_dashboard(
 
     root_layout = Layout(name="root")
     root_layout.split_column(
-        Layout(status_panel, name="top", ratio=clamp_row_ratio(status_row_ratio)),
         Layout(brief_panel, name="brief", ratio=clamp_row_ratio(brief_row_ratio)),
         Layout(bottom_layout, name="bottom", ratio=clamp_row_ratio(body_row_ratio)),
+        Layout(status_bar, name="status", size=status_bar_height),
         Layout(warning_bar, name="warnings", size=1),
     )
     return Panel(
@@ -2325,9 +2345,9 @@ def run(config: AppConfig, console: Console) -> int:
                 brief_focus=False,
                 brief_scroll=0,
                 active_section="feed",
-                status_row_ratio=4,
-                brief_row_ratio=5,
-                body_row_ratio=9,
+                status_row_ratio=2,
+                brief_row_ratio=8,
+                body_row_ratio=7,
                 terminal_width=console.size.width,
                 terminal_height=console.size.height,
             )
@@ -2345,9 +2365,9 @@ def run(config: AppConfig, console: Console) -> int:
         brief_focus=False,
         brief_scroll=0,
         active_section="feed",
-        status_row_ratio=4,
-        brief_row_ratio=5,
-        body_row_ratio=9,
+        status_row_ratio=2,
+        brief_row_ratio=8,
+        body_row_ratio=7,
         show_menu=False,
         in_command_mode=False,
         command_buffer="",
