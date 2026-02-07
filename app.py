@@ -152,6 +152,73 @@ def recency_score(published_at: datetime) -> float:
     return 1.0 / (1.0 + math.log(age_hours + 1.0))
 
 
+def age_hours_from_now(published_at: datetime) -> float:
+    return max((now_utc() - published_at).total_seconds() / 3600.0, 0.0)
+
+
+def recency_priority_score(published_at: datetime) -> float:
+    # Aggressive recency preference so very recent items surface in trending.
+    age_hours = age_hours_from_now(published_at)
+    base = math.exp(-age_hours / 36.0)
+    if age_hours <= 6:
+        base += 0.22
+    elif age_hours <= 24:
+        base += 0.10
+    return max(0.02, min(1.0, base))
+
+
+def dedupe_key(item: dict[str, Any]) -> str:
+    return item.get("url", "") or f'{item["source"]}:{item["title"][:80]}'
+
+
+def enforce_recent_source_mix(
+    items: list[dict[str, Any]],
+    required_sources: tuple[str, ...] = ("X", "Newsletter", "arXiv"),
+    recent_hours: int = 72,
+    top_slots: int = 6,
+) -> list[dict[str, Any]]:
+    if not items:
+        return items
+
+    selected: list[dict[str, Any]] = []
+    selected_keys: set[str] = set()
+    for source in required_sources:
+        candidates = [
+            item
+            for item in items
+            if item.get("source") == source and age_hours_from_now(item["published_at"]) <= recent_hours
+        ]
+        if not candidates:
+            continue
+        candidates.sort(
+            key=lambda item: (
+                item["published_at"],
+                float(item.get("trend_score", item.get("score", 0.0))),
+            ),
+            reverse=True,
+        )
+        candidate = candidates[0]
+        key = dedupe_key(candidate)
+        if key in selected_keys:
+            continue
+        selected.append(candidate)
+        selected_keys.add(key)
+
+    if not selected:
+        return items
+
+    selected = selected[: max(1, top_slots)]
+    selected.sort(
+        key=lambda item: (
+            item["published_at"],
+            float(item.get("trend_score", item.get("score", 0.0))),
+        ),
+        reverse=True,
+    )
+    remainder = [item for item in items if dedupe_key(item) not in selected_keys]
+    return selected + remainder
+
+
 def make_item(
     source: str,
     title: str,
@@ -585,6 +652,8 @@ def ollama_rank_items(
         "      \\\"relevance\\\": 0-10 number,\\n"
         "      \\\"novelty\\\": 0-10 number,\\n"
         "      \\\"impact\\\": 0-10 number,\\n"
+        "      \\\"editor_score\\\": 0-10 number (what a strong editor should surface),\\n"
+        "      \\\"freshness_priority\\\": 0-10 number (prefer breaking/recent items),\\n"
         "      \\\"summary\\\": \\\"<=35 words\\\",\\n"
         "      \\\"tags\\\": [\\\"tag1\\\", \\\"tag2\\\", \\\"tag3\\\"],\\n"
         "      \\\"reason\\\": \\\"<=18 words\\\"\\n"
@@ -673,6 +742,10 @@ def ollama_rank_items(
             "relevance": max(0.0, min(10.0, float(entry.get("relevance", 0) or 0))),
             "novelty": max(0.0, min(10.0, float(entry.get("novelty", 0) or 0))),
             "impact": max(0.0, min(10.0, float(entry.get("impact", 0) or 0))),
+            "editor_score": max(0.0, min(10.0, float(entry.get("editor_score", 0) or 0))),
+            "freshness_priority": max(
+                0.0, min(10.0, float(entry.get("freshness_priority", 0) or 0))
+            ),
             "summary": normalize_text(entry.get("summary", "")),
             "tags": [normalize_text(tag) for tag in entry.get("tags", []) if normalize_text(tag)],
             "reason": normalize_text(entry.get("reason", "")),
@@ -741,9 +814,11 @@ def apply_ollama_enrichment(
         llm_data = dedupe_key_to_llm.get(dedupe_key)
         if llm_data:
             llm_bonus = (
-                llm_data["relevance"] * 0.5
-                + llm_data["novelty"] * 0.3
-                + llm_data["impact"] * 0.2
+                llm_data["relevance"] * 0.30
+                + llm_data["novelty"] * 0.20
+                + llm_data["impact"] * 0.20
+                + llm_data["editor_score"] * 0.20
+                + llm_data["freshness_priority"] * 0.10
             ) / 10.0
             cloned["score"] = float(cloned["score"]) + llm_bonus
             cloned["llm"] = llm_data
@@ -847,7 +922,26 @@ def run_cycle(config: AppConfig) -> dict[str, Any]:
                 errors.append(llm_error)
 
     if config.sort_mode == "trending":
-        items.sort(key=lambda item: (item["score"], item["published_at"]), reverse=True)
+        for item in items:
+            llm = item.get("llm") or {}
+            base = float(item.get("score", 0.0))
+            recency = recency_priority_score(item["published_at"])
+            editor_score = float(llm.get("editor_score", 0.0)) / 10.0
+            freshness_pref = float(llm.get("freshness_priority", 0.0)) / 10.0
+            item["trend_score"] = (
+                base * 0.40
+                + recency * 0.45
+                + editor_score * 0.10
+                + freshness_pref * 0.05
+            )
+        items.sort(
+            key=lambda item: (
+                float(item.get("trend_score", item.get("score", 0.0))),
+                item["published_at"],
+            ),
+            reverse=True,
+        )
+        items = enforce_recent_source_mix(items, top_slots=min(6, max(3, config.max_items // 4)))
     else:
         items.sort(key=lambda item: item["published_at"], reverse=True)
 
@@ -960,6 +1054,8 @@ def format_story_markdown(item: dict[str, Any]) -> str:
                 f"- Relevance: `{llm.get('relevance', 0):.1f}`",
                 f"- Novelty: `{llm.get('novelty', 0):.1f}`",
                 f"- Impact: `{llm.get('impact', 0):.1f}`",
+                f"- Editor score: `{llm.get('editor_score', 0):.1f}`",
+                f"- Freshness priority: `{llm.get('freshness_priority', 0):.1f}`",
             ]
         )
         if llm.get("summary"):
