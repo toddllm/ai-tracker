@@ -1990,27 +1990,20 @@ def render_warning_text(warnings: list[str], terminal_width: int) -> str:
     return f"Warnings: {text}"
 
 
-def render_status_bar(
+def render_footer_text(
     line_one: str,
     line_two: str,
     warning_text: str,
     active_section: str,
     terminal_width: int,
-    status_row_ratio: int,
-) -> tuple[Text, int]:
-    max_chars = max(60, terminal_width - 4)
+) -> Text:
+    max_chars = max(60, terminal_width - 10)
     first = truncate(line_one, max_chars)
     second = truncate(line_two, max_chars)
+    merged = truncate(f"{warning_text} | {first} | {second}", max_chars)
+    merged = re.sub(r"\s*\|\s*$", "", merged)
     style = "bright_cyan" if active_section == "status" else "cyan"
-    line_count = 1 if status_row_ratio <= 4 else 2
-    if line_count == 1:
-        if warning_text != "Warnings: none":
-            merged = truncate(f"{warning_text} | {first}", max_chars)
-        else:
-            merged = truncate(f"{first} | {second}", max_chars)
-        merged = re.sub(r"\s*\|\s*$", "", merged)
-        return Text(f"Status: {merged}", style=style), line_count
-    return Text(f"Status: {first}\n{truncate(f'{second} | {warning_text}', max_chars)}", style=style), line_count
+    return Text(f"Status: {merged}", style=style)
 
 
 def render_right_section(
@@ -2076,8 +2069,7 @@ def build_dashboard(
     warnings.extend(errors)
     warning_text = render_warning_text(warnings, terminal_width)
 
-    status_bar_height = 1 if status_row_ratio <= 4 else 2
-    non_brief_rows = max(3, status_bar_height + 2)
+    non_brief_rows = 2
     content_rows = max(12, terminal_height - non_brief_rows)
     ratio_total = max(1, brief_row_ratio + body_row_ratio)
     estimated_brief_rows = max(8, int(content_rows * (brief_row_ratio / ratio_total)) - 2)
@@ -2110,13 +2102,12 @@ def build_dashboard(
         truncate(status_line_1, max(60, terminal_width - 12)),
         truncate(status_line_2, max(60, terminal_width - 12)),
     ]
-    status_bar, status_bar_height = render_status_bar(
+    footer_text = render_footer_text(
         line_one=status_lines[0],
         line_two=status_lines[1],
         warning_text=warning_text,
         active_section=active_section,
         terminal_width=terminal_width,
-        status_row_ratio=status_row_ratio,
     )
 
     if brief_focus:
@@ -2127,12 +2118,13 @@ def build_dashboard(
                 name="brief",
                 ratio=max(clamp_row_ratio(brief_row_ratio), clamp_row_ratio(body_row_ratio)),
             ),
-            Layout(status_bar, name="status", size=status_bar_height),
         )
         return Panel(
             focus_layout,
             title="AI Tracker Terminal",
             border_style="bright_blue",
+            subtitle=footer_text,
+            subtitle_align="left",
         )
 
     empty_message = (
@@ -2176,12 +2168,13 @@ def build_dashboard(
     root_layout.split_column(
         Layout(brief_panel, name="brief", ratio=clamp_row_ratio(brief_row_ratio)),
         Layout(bottom_layout, name="bottom", ratio=clamp_row_ratio(body_row_ratio)),
-        Layout(status_bar, name="status", size=status_bar_height),
     )
     return Panel(
         root_layout,
         title="AI Tracker Terminal",
         border_style="bright_blue",
+        subtitle=footer_text,
+        subtitle_align="left",
     )
 
 
