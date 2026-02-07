@@ -67,21 +67,29 @@ python app.py --sources newsletters --strict-topics --topics "agents, multimodal
 - `--newsletters all` or comma-separated names
 - `--quick-filter "open-source"`
 
-## Slash Commands (while running)
+## Keyboard + Commands
 
-Hotkeys:
+Normal mode hotkeys:
 
 - `/` enter command mode
-- `Enter` submit command (or open selected story in normal mode)
 - `Tab` next story
 - `Shift+Tab` previous story
 - `j`/`k` or `Down`/`Up` next/previous story
+- `Enter` open selected story link
 - `o` open selected story link
-- `b` toggle brief focus mode (makes brief much larger)
+- `b` toggle brief focus mode (larger brief area)
 - `[` / `]` resize right-hand panel narrower/wider
-- `Esc` cancel command mode
-- `m` toggle menu
+- `m` toggle menu panel
 - `q` quit immediately
+
+Command mode hotkeys:
+
+- `Enter` submit typed slash command
+- `Esc` cancel command mode
+- `Backspace` edit command buffer
+- printable keys append to command buffer
+
+Slash commands:
 
 Commands:
 
@@ -91,7 +99,7 @@ Commands:
 - `/sources <newsletters,arxiv,x>` change sources
 - `/newsletters <all|csv names>` change newsletter set
 - `/refresh` trigger immediate refresh now
-- `/open [index]` open selected story, or a 1-based index
+- `/open [index]` open selected story (or a specific 1-based index)
 - `/brief [focus|normal|toggle]` change brief focus mode
 - `/layout right <2..6>` resize right panel via command
 - `/export [md|json|csv] [path]` export current feed snapshot
