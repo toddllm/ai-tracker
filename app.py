@@ -18,6 +18,7 @@ import time
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from pathlib import Path
 from time import struct_time
 from typing import Any
@@ -92,6 +93,7 @@ class RuntimeState:
     selected_index: int
     right_column_ratio: int
     brief_focus: bool
+    brief_scroll: int
     show_menu: bool
     in_command_mode: bool
     command_buffer: str
@@ -645,7 +647,6 @@ def ollama_rank_items(
         "Return only a single JSON object, with no markdown or commentary.\\n"
         "Required JSON schema:\\n"
         "{\\n"
-        "  \\\"brief\\\": \\\"string\\\",\\n"
         "  \\\"items\\\": [\\n"
         "    {\\n"
         "      \\\"id\\\": \\\"item-1\\\",\\n"
@@ -660,6 +661,7 @@ def ollama_rank_items(
         "    }\\n"
         "  ]\\n"
         "}\\n"
+        "Do not include a long narrative in this JSON response.\\n"
         "Use all provided ids exactly once when possible.\\n"
         f"Feed items:\\n{serialized_items}"
     )
@@ -668,6 +670,7 @@ def ollama_rank_items(
         "model": ollama_model,
         "prompt": prompt,
         "stream": False,
+        "format": "json",
         "options": {
             "temperature": 0.1,
             "num_predict": 2000,
@@ -701,14 +704,16 @@ def ollama_rank_items(
     if not parsed:
         retry_prompt = (
             "Return JSON only. If uncertain, still return valid JSON with empty items. "
-            "Schema: {\"brief\":\"string\",\"items\":[{\"id\":\"item-1\",\"relevance\":0,"
-            "\"novelty\":0,\"impact\":0,\"summary\":\"\",\"tags\":[],\"reason\":\"\"}]}.\n"
+            "Schema: {\"items\":[{\"id\":\"item-1\",\"relevance\":0,\"novelty\":0,"
+            "\"impact\":0,\"editor_score\":0,\"freshness_priority\":0,"
+            "\"summary\":\"\",\"tags\":[],\"reason\":\"\"}]}.\n"
             f"Feed items:\n{serialized_items}"
         )
         retry_payload = {
             "model": ollama_model,
             "prompt": retry_prompt,
             "stream": False,
+            "format": "json",
             "options": {
                 "temperature": 0.0,
                 "num_predict": 1000,
@@ -722,12 +727,12 @@ def ollama_rank_items(
             if not parsed and retry_raw.strip():
                 return {
                     "analysis": {},
-                    "brief": normalize_text(retry_raw)[:320],
+                    "brief": retry_raw.strip(),
                     "error": "",
                 }
 
     if not parsed:
-        fallback_brief = normalize_text(raw_response)[:320]
+        fallback_brief = raw_response.strip()
         return {
             "analysis": {},
             "brief": fallback_brief,
@@ -751,11 +756,90 @@ def ollama_rank_items(
             "reason": normalize_text(entry.get("reason", "")),
         }
 
+    brief_value = ""
+    for key in ("brief_markdown", "brief", "summary", "content"):
+        candidate = parsed.get(key)
+        if isinstance(candidate, str) and candidate.strip():
+            brief_value = candidate.strip()
+            break
+
     return {
         "analysis": analysis,
-        "brief": normalize_text(parsed.get("brief", "")),
+        "brief": brief_value,
         "error": "",
     }
+
+
+def ollama_editor_brief_markdown(
+    ollama_host: str,
+    ollama_model: str,
+    topics_csv: str,
+    serialized_items: str,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    base = sanitize_ollama_host(ollama_host)
+    if not base:
+        return {"brief_markdown": "", "error": "Missing Ollama host."}
+    if not ollama_model:
+        return {"brief_markdown": "", "error": "No Ollama model selected."}
+
+    topics = parse_keywords(topics_csv)
+    topic_text = ", ".join(topics) if topics else "general AI updates"
+    prompt = (
+        "You are an AI news editor. Write a detailed markdown briefing from the feed items.\n"
+        f"Priority topics: {topic_text}\n"
+        "Output markdown only (no JSON).\n"
+        "Use this structure exactly:\n"
+        "# AI Briefing\n"
+        "## Top Developments\n"
+        "- 4-8 bullet points\n"
+        "## Source Highlights\n"
+        "### X\n"
+        "### arXiv\n"
+        "### Newsletters\n"
+        "## Editor Notes\n"
+        "- Why this matters now\n"
+        "- What to watch next\n"
+        "Length target: 500-1400 words.\n"
+        "Use concise paragraphs, bullet lists, and explicit links when available.\n"
+        "Finish with complete sentences; do not cut off the final section.\n"
+        f"Feed items:\n{serialized_items}"
+    )
+    payload = {
+        "model": ollama_model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "temperature": 0.2,
+            "num_predict": 6000,
+        },
+    }
+    try:
+        response = requests.post(
+            f"{base}/api/generate",
+            json=payload,
+            timeout=timeout_seconds,
+        )
+        response.raise_for_status()
+        result = response.json()
+    except requests.RequestException as exc:
+        return {
+            "brief_markdown": "",
+            "error": f"Ollama brief failed ({normalize_text(str(exc))[:160]}).",
+        }
+
+    raw_response = str(result.get("response", "")).strip()
+    if not raw_response:
+        return {"brief_markdown": "", "error": "Ollama brief was empty."}
+
+    parsed = extract_json_object(raw_response)
+    if parsed:
+        for key in ("brief_markdown", "brief", "summary", "content"):
+            candidate = parsed.get(key)
+            normalized = normalize_markdown_text(candidate)
+            if normalized:
+                return {"brief_markdown": normalized, "error": ""}
+    return {"brief_markdown": normalize_markdown_text(raw_response), "error": ""}
 
 
 def apply_ollama_enrichment(
@@ -789,12 +873,13 @@ def apply_ollama_enrichment(
                 "published_at": item["published_at"].isoformat(),
             }
         )
+    serialized_payload = json.dumps(payload, ensure_ascii=True)
 
     ranking_result = ollama_rank_items(
         ollama_host=ollama_host,
         ollama_model=ollama_model,
         topics_csv=topics_csv,
-        serialized_items=json.dumps(payload, ensure_ascii=True),
+        serialized_items=serialized_payload,
         timeout_seconds=timeout_seconds,
     )
     if ranking_result["error"]:
@@ -824,7 +909,18 @@ def apply_ollama_enrichment(
             cloned["llm"] = llm_data
         updated.append(cloned)
 
-    return updated, ranking_result["brief"], ""
+    editor_brief = ollama_editor_brief_markdown(
+        ollama_host=ollama_host,
+        ollama_model=ollama_model,
+        topics_csv=topics_csv,
+        serialized_items=serialized_payload,
+        timeout_seconds=timeout_seconds,
+    )
+    brief_markdown = editor_brief["brief_markdown"] or ranking_result["brief"]
+    if editor_brief["error"]:
+        return updated, brief_markdown, editor_brief["error"]
+
+    return updated, brief_markdown, ""
 
 
 def truncate(value: str, width: int) -> str:
@@ -1003,24 +1099,116 @@ def open_link(url: str) -> str:
         return f"Failed to open link: {exc}"
 
 
+def strip_code_fence(text: str) -> str:
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return stripped
+    lines = stripped.splitlines()
+    if len(lines) >= 3 and lines[-1].strip() == "```":
+        return "\n".join(lines[1:-1]).strip()
+    return stripped
+
+
+def normalize_markdown_text(raw: Any) -> str:
+    if raw is None:
+        return ""
+    if isinstance(raw, (list, tuple)):
+        parts = [normalize_markdown_text(part) for part in raw]
+        return "\n".join(part for part in parts if part).strip()
+    text = raw if isinstance(raw, str) else str(raw)
+    text = html.unescape(text)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return strip_code_fence(text).strip()
+
+
 def format_llm_brief_markdown(brief: str) -> str:
-    cleaned = brief.strip()
+    cleaned = normalize_markdown_text(brief)
     if not cleaned:
         return "_No brief available yet._"
 
     parsed = extract_json_object(cleaned)
-    if not parsed and cleaned.startswith("{") and cleaned.endswith("}"):
-        try:
-            raw = json.loads(cleaned)
-            if isinstance(raw, dict):
-                parsed = raw
-        except json.JSONDecodeError:
-            parsed = {}
     if parsed:
-        extracted = normalize_text(parsed.get("brief", ""))
+        for key in ("brief_markdown", "brief", "summary", "content"):
+            extracted = normalize_markdown_text(parsed.get(key))
+            if extracted:
+                return extracted
+
+    try:
+        raw = json.loads(cleaned)
+    except json.JSONDecodeError:
+        raw = None
+    if isinstance(raw, str):
+        extracted = normalize_markdown_text(raw)
         if extracted:
             return extracted
+    elif isinstance(raw, dict):
+        for key in ("brief_markdown", "brief", "summary", "content"):
+            extracted = normalize_markdown_text(raw.get(key))
+            if extracted:
+                return extracted
+
     return cleaned
+
+
+@lru_cache(maxsize=32)
+def render_markdown_lines(markdown_text: str, width: int) -> tuple[str, ...]:
+    render_width = max(40, width)
+    render_console = Console(
+        width=render_width,
+        force_terminal=False,
+        color_system=None,
+    )
+    with render_console.capture() as capture:
+        render_console.print(Markdown(markdown_text))
+    rendered = capture.get().strip("\n")
+    if not rendered:
+        return ("",)
+    return tuple(rendered.splitlines())
+
+
+def build_brief_panel(
+    llm_brief: str,
+    brief_focus: bool,
+    brief_scroll: int,
+    terminal_width: int,
+    terminal_height: int,
+) -> tuple[Panel, int, int]:
+    markdown_text = format_llm_brief_markdown(llm_brief)
+    if markdown_text == "_No brief available yet._":
+        return (
+            Panel(Markdown(markdown_text), title="Ollama Brief", border_style="green"),
+            0,
+            0,
+        )
+
+    content_width = max(
+        50,
+        terminal_width - 12 if brief_focus else (terminal_width // 2) - 10,
+    )
+    rendered_lines = list(render_markdown_lines(markdown_text, content_width))
+    if not rendered_lines:
+        rendered_lines = [""]
+
+    visible_lines = (
+        max(10, terminal_height - 18)
+        if brief_focus
+        else max(6, min(18, terminal_height // 4))
+    )
+    max_scroll = max(0, len(rendered_lines) - visible_lines)
+    offset = max(0, min(brief_scroll, max_scroll))
+    window = rendered_lines[offset : offset + visible_lines]
+    line_end = offset + len(window)
+    footer = f"Lines {offset + 1}-{line_end}/{len(rendered_lines)}"
+    if max_scroll > 0:
+        footer += " | PgUp/PgDn scroll"
+        if brief_focus:
+            footer += " | Up/Down scroll in focus mode"
+
+    body = "\n".join(window).rstrip()
+    if body:
+        body += "\n\n"
+    body += footer
+    return Panel(body, title="Ollama Brief", border_style="green"), max_scroll, offset
 
 
 def format_story_markdown(item: dict[str, Any]) -> str:
@@ -1297,7 +1485,7 @@ def handle_slash_command(
                 runtime_state,
                 "Commands: /help | /config | /set <key> <value> | /sources <csv> | "
                 "/newsletters <all|csv> | /refresh | /export [md|json|csv] [path] | "
-                "/open [index] | /brief [focus|normal|toggle] | /layout [right 2-6] | "
+                "/open [index] | /brief [focus|normal|toggle|top] | /layout [right 2-6] | "
                 "/menu [on|off|toggle] | /clearlog | /quit",
             )
         return False
@@ -1329,11 +1517,16 @@ def handle_slash_command(
                 runtime_state.brief_focus = True
             elif mode in {"normal", "off"}:
                 runtime_state.brief_focus = False
-            else:
+            elif mode == "top":
+                runtime_state.brief_scroll = 0
+            elif mode == "toggle":
                 runtime_state.brief_focus = not runtime_state.brief_focus
+            else:
+                append_command_log(runtime_state, "Usage: /brief [focus|normal|toggle|top]")
+                return False
             append_command_log(
                 runtime_state,
-                f"brief_focus -> {runtime_state.brief_focus}",
+                f"brief_focus -> {runtime_state.brief_focus} | brief_scroll -> {runtime_state.brief_scroll}",
             )
         return False
 
@@ -1521,6 +1714,7 @@ def refresh_worker(
                 runtime_state.selected_index,
                 runtime_state.cycle_state.get("items", []),
             )
+            runtime_state.brief_scroll = 0
             runtime_state.next_run_at = now_utc() + timedelta(minutes=config.refresh_minutes)
             runtime_state.is_refreshing = False
             runtime_state.status_message = "Idle"
@@ -1641,7 +1835,9 @@ def render_menu_panel(show_menu: bool) -> Panel:
         "- / : enter command mode\n"
         "- Enter : submit command (or open story in normal mode)\n"
         "- Tab / Shift+Tab : next/prev story\n"
-        "- j / k or Down / Up : next/prev story\n"
+        "- j / k : next/prev story\n"
+        "- Up / Down : next/prev story (or brief scroll in focus mode)\n"
+        "- PgUp / PgDn : scroll brief\n"
         "- o : open selected story link\n"
         "- b : toggle brief focus mode\n"
         "- [ / ] : resize right column narrower/wider\n"
@@ -1656,7 +1852,7 @@ def render_menu_panel(show_menu: bool) -> Panel:
         "- /newsletters <all|csv>\n"
         "- /refresh\n"
         "- /open [index]\n"
-        "- /brief [focus|normal|toggle]\n"
+        "- /brief [focus|normal|toggle|top]\n"
         "- /layout right <2..6>\n"
         "- /export [md|json|csv] [path]\n"
         "- /quit"
@@ -1677,6 +1873,9 @@ def build_dashboard(
     selected_index: int,
     right_column_ratio: int,
     brief_focus: bool,
+    brief_scroll: int,
+    terminal_width: int,
+    terminal_height: int,
 ) -> Panel:
     started: datetime = cycle_state["started"]
     elapsed_seconds: float = cycle_state["elapsed_seconds"]
@@ -1686,22 +1885,33 @@ def build_dashboard(
     models: list[dict[str, Any]] = cycle_state["models"]
     model_error: str = cycle_state["model_error"]
 
+    brief_panel, max_brief_scroll, clamped_brief_scroll = build_brief_panel(
+        llm_brief=llm_brief,
+        brief_focus=brief_focus,
+        brief_scroll=brief_scroll,
+        terminal_width=terminal_width,
+        terminal_height=terminal_height,
+    )
+
     status_lines = [
         f"Last refresh: {started.strftime('%Y-%m-%d %H:%M:%S UTC')}",
         f"Next refresh in: {seconds_to_next_run}s",
         f"Cycle runtime: {elapsed_seconds:.1f}s",
         f"State: {'refreshing' if is_refreshing else 'idle'}",
         f"Message: {status_message}",
-        "Input: / command mode | Tab navigate | Enter/o open | b brief | [ ] resize | q quit",
+        (
+            "Input: / command mode | Tab/j/k navigate | Enter/o open | "
+            "b brief focus | PgUp/PgDn brief scroll | [ ] resize | q quit"
+        ),
         f"Topics: {config.topics or '(none)'}",
         f"Mode: {'strict' if config.strict_topics else 'broad'} | Sort: {config.sort_mode}",
-        f"Layout: right_col={right_column_ratio} | brief_focus={brief_focus}",
+        (
+            f"Layout: right_col={right_column_ratio} | brief_focus={brief_focus} | "
+            f"brief_scroll={clamped_brief_scroll}/{max_brief_scroll}"
+        ),
         f"Analysis model: {config.ollama_model} | Analysis limit: {config.analysis_limit}",
     ]
     status_panel = Panel("\n".join(status_lines), title="Status", border_style="cyan")
-
-    brief_markdown = Markdown(format_llm_brief_markdown(llm_brief))
-    brief_panel = Panel(brief_markdown, title="Ollama Brief", border_style="green")
 
     warnings: list[str] = []
     if model_error:
@@ -1728,6 +1938,21 @@ def build_dashboard(
     bottom_row = Table.grid(expand=True)
     bottom_row.add_column(ratio=left_ratio)
     bottom_row.add_column(ratio=right_ratio)
+    if brief_focus:
+        focus_sections: list[Any] = [
+            top_row,
+            brief_panel,
+            render_selected_story_panel(items, selected_index),
+            render_command_panel(command_log, in_command_mode, command_buffer),
+        ]
+        if show_menu:
+            focus_sections.append(render_menu_panel(show_menu))
+        return Panel(
+            Group(*focus_sections),
+            title="AI Tracker Terminal",
+            border_style="bright_blue",
+        )
+
     empty_message = (
         "Loading first refresh... TUI is active and updates will appear shortly."
         if is_refreshing
@@ -1740,17 +1965,6 @@ def build_dashboard(
         render_menu_panel(show_menu),
         render_command_panel(command_log, in_command_mode, command_buffer),
     )
-    if brief_focus:
-        bottom_row.add_row(
-            brief_panel,
-            right_group,
-        )
-        return Panel(
-            Group(top_row, bottom_row),
-            title="AI Tracker Terminal",
-            border_style="bright_blue",
-        )
-
     bottom_row.add_row(
         render_feed_table(items, config.max_items, empty_message, selected_index),
         right_group,
@@ -1890,7 +2104,9 @@ def command_input_worker(
                 sequence = ""
                 while select.select([fd], [], [], 0.001)[0]:
                     sequence += os.read(fd, 1).decode("utf-8", errors="ignore")
-                    if len(sequence) >= 3:
+                    if not sequence:
+                        continue
+                    if sequence[-1].isalpha() or sequence.endswith("~") or len(sequence) >= 6:
                         break
                 if sequence == "[A":
                     command_queue.put(("key", "UP"))
@@ -1898,6 +2114,10 @@ def command_input_worker(
                     command_queue.put(("key", "DOWN"))
                 elif sequence == "[Z":
                     command_queue.put(("key", "SHTAB"))
+                elif sequence == "[5~":
+                    command_queue.put(("key", "PGUP"))
+                elif sequence == "[6~":
+                    command_queue.put(("key", "PGDN"))
                 else:
                     command_queue.put(("key", "ESC"))
                 continue
@@ -1929,6 +2149,9 @@ def run(config: AppConfig, console: Console) -> int:
                 selected_index=0,
                 right_column_ratio=3,
                 brief_focus=False,
+                brief_scroll=0,
+                terminal_width=console.size.width,
+                terminal_height=console.size.height,
             )
         )
         return 0
@@ -1942,6 +2165,7 @@ def run(config: AppConfig, console: Console) -> int:
         selected_index=0,
         right_column_ratio=3,
         brief_focus=False,
+        brief_scroll=0,
         show_menu=False,
         in_command_mode=False,
         command_buffer="",
@@ -1973,6 +2197,7 @@ def run(config: AppConfig, console: Console) -> int:
     initial_selected_index = runtime_state.selected_index
     initial_right_column_ratio = runtime_state.right_column_ratio
     initial_brief_focus = runtime_state.brief_focus
+    initial_brief_scroll = runtime_state.brief_scroll
     with Live(
         build_dashboard(
             config,
@@ -1987,6 +2212,9 @@ def run(config: AppConfig, console: Console) -> int:
             selected_index=initial_selected_index,
             right_column_ratio=initial_right_column_ratio,
             brief_focus=initial_brief_focus,
+            brief_scroll=initial_brief_scroll,
+            terminal_width=console.size.width,
+            terminal_height=console.size.height,
         ),
         console=console,
         refresh_per_second=4,
@@ -2032,6 +2260,18 @@ def run(config: AppConfig, console: Console) -> int:
                                         runtime_state,
                                         f"brief_focus -> {runtime_state.brief_focus}",
                                     )
+                                    continue
+                                if event_value == "PGUP":
+                                    runtime_state.brief_scroll = max(0, runtime_state.brief_scroll - 8)
+                                    continue
+                                if event_value == "PGDN":
+                                    runtime_state.brief_scroll += 8
+                                    continue
+                                if event_value == "UP" and runtime_state.brief_focus:
+                                    runtime_state.brief_scroll = max(0, runtime_state.brief_scroll - 2)
+                                    continue
+                                if event_value == "DOWN" and runtime_state.brief_focus:
+                                    runtime_state.brief_scroll += 2
                                     continue
                                 if event_value == "[":
                                     runtime_state.right_column_ratio = clamp_right_column_ratio(
@@ -2138,6 +2378,7 @@ def run(config: AppConfig, console: Console) -> int:
                     selected_index = runtime_state.selected_index
                     right_column_ratio = runtime_state.right_column_ratio
                     brief_focus = runtime_state.brief_focus
+                    brief_scroll = runtime_state.brief_scroll
                     show_menu = runtime_state.show_menu
                     in_command_mode = runtime_state.in_command_mode
                     command_buffer = runtime_state.command_buffer
@@ -2157,6 +2398,9 @@ def run(config: AppConfig, console: Console) -> int:
                         command_buffer=command_buffer,
                         right_column_ratio=right_column_ratio,
                         brief_focus=brief_focus,
+                        brief_scroll=brief_scroll,
+                        terminal_width=console.size.width,
+                        terminal_height=console.size.height,
                     )
                 )
                 time.sleep(1)

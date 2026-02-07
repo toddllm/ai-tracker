@@ -10,6 +10,7 @@ It runs as a live terminal dashboard and:
 - refreshes feed data hourly (default)
 - keeps a real-time Ollama model list (size-sorted)
 - analyzes top feed items using local Ollama model `gpt-oss:120b` by default
+- generates a long-form Ollama markdown briefing with scroll support in the TUI
 - ranks by newest or trending
 - supports keyboard navigation and opening story links directly from the TUI
 
@@ -74,10 +75,12 @@ Normal mode hotkeys:
 - `/` enter command mode
 - `Tab` next story
 - `Shift+Tab` previous story
-- `j`/`k` or `Down`/`Up` next/previous story
+- `j`/`k` next/previous story
+- `Down`/`Up` next/previous story (or brief scroll in brief-focus mode)
+- `PgDn`/`PgUp` scroll long Ollama brief
 - `Enter` open selected story link
 - `o` open selected story link
-- `b` toggle brief focus mode (larger brief area)
+- `b` toggle brief focus mode (full-width brief reader)
 - `[` / `]` resize right-hand panel narrower/wider
 - `m` toggle menu panel
 - `q` quit immediately
@@ -100,7 +103,7 @@ Commands:
 - `/newsletters <all|csv names>` change newsletter set
 - `/refresh` trigger immediate refresh now
 - `/open [index]` open selected story (or a specific 1-based index)
-- `/brief [focus|normal|toggle]` change brief focus mode
+- `/brief [focus|normal|toggle|top]` change brief focus mode or jump brief to top
 - `/layout right <2..6>` resize right panel via command
 - `/export [md|json|csv] [path]` export current feed snapshot
 - `/menu [on|off|toggle]` show/hide menu panel
